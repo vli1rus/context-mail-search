@@ -33,23 +33,27 @@ def russian_correction(word, vocabulary):
         return candidate if candidate in vocabulary else None
     if len(word) < 5:
         return None
+    # Prefer a unique swapped adjacent pair over arbitrary character edits.
+    swaps = {candidate for i in range(len(word) - 1)
+             if word[i] != word[i + 1]
+             and (candidate := stem(word[:i] + word[i + 1] + word[i] + word[i + 2:])) in vocabulary}
+    if len(swaps) == 1:
+        return next(iter(swaps))
     candidates = set()
     for i, char in enumerate(word):
         left, right = word[:i], word[i + 1:]
         candidates.add(left + right)
-        if right:
-            candidates.add(left + right[0] + char + right[1:])
         for letter in RUSSIAN_ALPHABET:
             candidates.add(left + letter + right)
             candidates.add(left + letter + char + right)
     candidates.update(word + letter for letter in RUSSIAN_ALPHABET)
-    matches = {key for candidate in candidates if (key := stem(candidate)) in vocabulary}
+    matches = swaps | {key for candidate in candidates if (key := stem(candidate)) in vocabulary}
     return next(iter(matches)) if len(matches) == 1 else None
 
 
 WORD = re.compile(r'[^\W_]+', re.UNICODE)
 ANCHOR = re.compile(
-    r'(?<![\w@])(?:[\w.+%-]+@[\w.-]+\.[a-zа-я]{2,}|[a-zа-я]{1,12}[-_]?\d{2,}[a-zа-я\d-]*|'
+    r'(?<![\w@])(?:[\w.+%-]+@[\w.-]+\.[a-zа-я]{2,}|syn-[0-9a-f]{8,24}(?![-_])|[a-zа-я]{1,12}[-_]?\d{2,}[a-zа-я\d-]*|'
     r'\d{2,}[-_]?[a-zа-я]{1,12}[a-zа-я\d-]*|\d{5,})(?!\w)', re.I,
 )
 EXPLICIT_NUMBER = re.compile(r'(?:№\s*|\b(?:номер|заказ)\s*#?\s*)(\d{3,})\b', re.I)
@@ -118,6 +122,14 @@ def anchors(text):
     value = unicodedata.normalize('NFKC', text).translate(HYPHENS)
     numbered = {anchor_key(match[1]) for match in EXPLICIT_NUMBER.finditer(text)}
     return numbered | {anchor_key(match[0]) for match in ANCHOR.finditer(value)}
+
+
+def standalone_anchor(text):
+    value = normalized(text.strip()).translate(HYPHENS)
+    if ANCHOR.fullmatch(value):
+        return anchor_key(value)
+    explicit = EXPLICIT_NUMBER.fullmatch(value)
+    return anchor_key(explicit[1]) if explicit else None
 
 
 INTENTS = defaultdict(set)
@@ -327,6 +339,11 @@ class SearchEngine:
         scope = self.eligible(mailbox, after, before, as_of)
         if scope is not None and not scope:
             return []
+        # A lookup consisting of a single identifier has no fuzzy fallback:
+        # fragments of other identifiers would swamp the precise match.
+        literal = standalone_anchor(query) if mode == 'smart' and not period else None
+        if literal:
+            return self._lookup_anchor(literal, scope, limit)
         engine, indices = self, None
         if mode == 'smart' and self.dense is None and scope is not None and len(scope) < len(self.letters):
             indices, engine = self._visible_index((mailbox, after, before, as_of), scope)
@@ -335,6 +352,19 @@ class SearchEngine:
         if indices is None:
             return hits
         return [Hit(indices[h.index], h.score, h.evidence, h.signals) for h in hits]
+
+    def _lookup_anchor(self, anchor, scope, limit):
+        matching = self.anchor_index.get(anchor, set())
+        if scope is not None:
+            matching = matching & scope
+        indices = heapq.nlargest(limit, matching, key=lambda i: (self.dates[i], self.letters[i].date, -i))
+        hits = []
+        for i in indices:
+            letter = self.letters[i]
+            # An address or number may only be present in a header.
+            excerpt = next((text for text in (*self.passages[i], letter.subject, letter.sender) if anchor in anchors(text)), '')
+            hits.append(Hit(i, 1.0, clipped_evidence(excerpt, set(), {anchor}), ('Совпал номер или адрес',)))
+        return hits
 
     def _rank(self, query, mode, limit, scope, as_of, period):
         if mode == 'smart' and query.isascii() and not any(char.isdigit() for char in query) and '@' not in query:

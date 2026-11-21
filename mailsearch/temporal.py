@@ -49,24 +49,31 @@ def relative_range(query, as_of):
         return first.isoformat(), last.isoformat()
 
     if re.search(r'\b(?:позавчера|позавчерашн\w*)\b', query):
-        target = current - timedelta(days=2)
+        target = subtract_days(current, 2)
         return span(target, target)
     if re.search(r'\b(?:вчера|вчерашн\w*)\b', query):
-        target = current - timedelta(days=1)
+        target = subtract_days(current, 1)
         return span(target, target)
     if re.search(r'\b(?:сегодня|сегодняшн\w*)\b', query):
         return span(current, current)
     recent = re.search(r'\b(?:за\s+)?последн\w*\s+(\d{1,3})\s+(день|дня|дней|недел\w*)\b', query)
     if recent and int(recent[1]):
         days = int(recent[1]) * (7 if recent[2].startswith('недел') else 1)
-        return span(current - timedelta(days=days - 1), current)
+        return span(subtract_days(current, days - 1), current)
     if re.search(r'\bна\s+(?:прошлой|этой)\s+неделе\b', query):
-        monday = current - timedelta(days=current.weekday())
-        return span(monday - timedelta(days=7), monday - timedelta(days=1)) if 'прошлой' in query else span(monday, current)
+        monday = subtract_days(current, current.weekday())
+        return span(subtract_days(monday, 7), subtract_days(monday, 1)) if 'прошлой' in query else span(monday, current)
     if re.search(r'\bв\s+(?:прошлом|этом)\s+месяце\b', query):
         first = current.replace(day=1)
         if 'прошлом' in query:
-            last = first - timedelta(days=1)
+            last = subtract_days(first, 1)
             return span(last.replace(day=1), last)
         return span(first, current)
     return '', ''
+
+
+def subtract_days(day, days):
+    try:
+        return day - timedelta(days=days)
+    except OverflowError as exc:
+        raise ValueError('Период выходит за пределы календаря. Укажите другую дату поиска.') from exc
