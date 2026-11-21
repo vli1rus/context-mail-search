@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { chromium } from 'playwright';
 
@@ -18,9 +20,11 @@ try {
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(url);
     await page.locator('.mail-item').first().waitFor();
+    const headerColor = () => page.locator('.topbar').evaluate(header => getComputedStyle(header).backgroundColor);
+    assert.equal(await headerColor(), 'rgb(255, 255, 255)');
     assert.equal(await page.locator('#letter').isVisible(), false);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
-    await page.screenshot({path: '/tmp/context-inbox-' + width + '.png'});
+    await page.screenshot({path: join(tmpdir(), 'context-inbox-' + width + '.png')});
     if (width < 760) await page.getByRole('button', {name: 'Ящики и папки'}).click();
     await page.locator('#mailboxes button', {hasText: 'Поездки'}).click();
     await page.getByRole('searchbox').fill('Где писали, что самолёт улетит позже?');
@@ -41,9 +45,17 @@ try {
     assert.deepEqual(errors, []);
     if (width < 760) await page.getByRole('button', {name: 'Ящики и папки'}).click();
     await page.locator('#preferences').click();
+    await page.locator('#theme').selectOption('plum');
+    assert.equal(await headerColor(), 'rgb(234, 217, 238)');
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('.topbar')).backgroundColor === 'rgb(255, 255, 255)');
+    await page.locator('#settings').waitFor({state: 'hidden'});
+    if (width < 760) await page.getByRole('button', {name: 'Ящики и папки'}).click();
+    await page.locator('#preferences').click();
     await page.locator('#edit-box').selectOption('Поездки');
     await page.locator('#box-name').fill('Командировки');
     await page.locator('#theme').selectOption('sage');
+    assert.equal(await headerColor(), 'rgb(215, 233, 221)');
     await page.locator('#label-name').fill('Важное');
     await page.locator('#label-color').selectOption('orange');
     await page.locator('#settings-form button[type=submit]').click();
@@ -51,6 +63,7 @@ try {
     if (width < 760) await page.getByRole('button', {name: 'Ящики и папки'}).click();
     await page.getByRole('button',{name:/Командировки/}).click();
     assert.equal(await page.locator('body').getAttribute('data-theme'),'sage');
+    assert.equal(await headerColor(), 'rgb(215, 233, 221)');
     await page.locator('.mail-item').first().click();
     await page.locator('#message-label').selectOption({label:'Важное'});
     if (width < 760) await page.getByRole('button', {name: 'Ящики и папки'}).click();
