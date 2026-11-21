@@ -248,8 +248,20 @@ function submitSearch() {
   refresh();
 }
 
-element('home').addEventListener('click', () => selectMailbox('', false, true));
-element('all-mail').addEventListener('click', () => selectMailbox('', false, true));
+function resetDates() {
+  element('after').value = '';
+  element('before').value = '';
+  element('as-of').value = state.meta?.reference_day || '';
+}
+
+function goToInbox() {
+  resetDates();
+  if (location.hash.startsWith('#search?')) history.replaceState(null, '', location.pathname + location.search);
+  selectMailbox('', false, true);
+}
+
+element('home').addEventListener('click', goToInbox);
+element('all-mail').addEventListener('click', goToInbox);
 element('saved-mail').addEventListener('click', () => selectMailbox('', true, true));
 element('search-form').addEventListener('submit', (event) => { event.preventDefault(); submitSearch(); });
 queryInput.addEventListener('search', () => { if (!queryInput.value && state.query) submitSearch(); });
@@ -260,8 +272,7 @@ element('filters-toggle').addEventListener('click', () => {
 });
 for (const id of ['after', 'before', 'as-of']) element(id).addEventListener('change', () => { state.page = 0; refresh(); });
 element('reset-filters').addEventListener('click', () => {
-  for (const id of ['after', 'before', 'as-of']) element(id).value = '';
-  element('as-of').value = state.meta?.reference_day || '';
+  resetDates();
   state.page = 0;
   refresh();
 });
@@ -297,6 +308,32 @@ document.addEventListener('keydown', (event) => {
   }
 });
 
+function restoreSearchLink(meta) {
+  const prefix = '#search?';
+  if (!location.hash.startsWith(prefix)) return;
+  const link = new URLSearchParams(location.hash.slice(prefix.length));
+  const query = (link.get('q') || '').trim();
+  const mailbox = link.get('mailbox') || '';
+  const asOf = link.get('as_of') || '';
+  const mode = link.get('mode') || 'smart';
+  if (!query || query.length > queryInput.maxLength ||
+      (mailbox && !meta.mailboxes.some(box => box.id === mailbox)) ||
+      !['smart', 'lexical', 'semantic'].includes(mode)) return;
+  const dateField = element('as-of');
+  if (asOf) {
+    dateField.value = asOf;
+    if (dateField.value !== asOf) {
+      resetDates();
+      return;
+    }
+    element('filters').hidden = false;
+    element('filters-toggle').setAttribute('aria-expanded', 'true');
+  }
+  queryInput.value = state.query = query;
+  state.mailbox = mailbox;
+  state.mode = mode;
+}
+
 async function init() {
   try {
     const { body } = await api('meta');
@@ -311,6 +348,7 @@ async function init() {
     element('source-label').textContent = body.demo ? 'Демонстрационные письма' : 'Архив хакатона';
     element('as-of').value = body.reference_day || '';
     element('semantic-mode').textContent = body.semantic ? 'По смыслу' : 'По теме';
+    restoreSearchLink(body);
     renderFolders();
     await refresh();
   } catch (error) {
