@@ -286,27 +286,34 @@ def relative_range(query, as_of):
         return first.isoformat(), last.isoformat()
 
     if re.search(r'\b(?:позавчера|позавчерашн\w*)\b', query):
-        target = current - timedelta(days=2)
+        target = subtract_days(current, 2)
         return span(target, target)
     if re.search(r'\b(?:вчера|вчерашн\w*)\b', query):
-        target = current - timedelta(days=1)
+        target = subtract_days(current, 1)
         return span(target, target)
     if re.search(r'\b(?:сегодня|сегодняшн\w*)\b', query):
         return span(current, current)
     recent = re.search(r'\b(?:за\s+)?последн\w*\s+(\d{1,3})\s+(день|дня|дней|недел\w*)\b', query)
     if recent and int(recent[1]):
         days = int(recent[1]) * (7 if recent[2].startswith('недел') else 1)
-        return span(current - timedelta(days=days - 1), current)
+        return span(subtract_days(current, days - 1), current)
     if re.search(r'\bна\s+(?:прошлой|этой)\s+неделе\b', query):
-        monday = current - timedelta(days=current.weekday())
-        return span(monday - timedelta(days=7), monday - timedelta(days=1)) if 'прошлой' in query else span(monday, current)
+        monday = subtract_days(current, current.weekday())
+        return span(subtract_days(monday, 7), subtract_days(monday, 1)) if 'прошлой' in query else span(monday, current)
     if re.search(r'\bв\s+(?:прошлом|этом)\s+месяце\b', query):
         first = current.replace(day=1)
         if 'прошлом' in query:
-            last = first - timedelta(days=1)
+            last = subtract_days(first, 1)
             return span(last.replace(day=1), last)
         return span(first, current)
     return '', ''
+
+
+def subtract_days(day, days):
+    try:
+        return day - timedelta(days=days)
+    except OverflowError as exc:
+        raise ValueError('Период выходит за пределы календаря. Укажите другую дату поиска.') from exc
 
 
 # semantic.py
@@ -493,23 +500,27 @@ def russian_correction(word, vocabulary):
         return candidate if candidate in vocabulary else None
     if len(word) < 5:
         return None
+    # Prefer a unique swapped adjacent pair over arbitrary character edits.
+    swaps = {candidate for i in range(len(word) - 1)
+             if word[i] != word[i + 1]
+             and (candidate := stem(word[:i] + word[i + 1] + word[i] + word[i + 2:])) in vocabulary}
+    if len(swaps) == 1:
+        return next(iter(swaps))
     candidates = set()
     for i, char in enumerate(word):
         left, right = word[:i], word[i + 1:]
         candidates.add(left + right)
-        if right:
-            candidates.add(left + right[0] + char + right[1:])
         for letter in RUSSIAN_ALPHABET:
             candidates.add(left + letter + right)
             candidates.add(left + letter + char + right)
     candidates.update(word + letter for letter in RUSSIAN_ALPHABET)
-    matches = {key for candidate in candidates if (key := stem(candidate)) in vocabulary}
+    matches = swaps | {key for candidate in candidates if (key := stem(candidate)) in vocabulary}
     return next(iter(matches)) if len(matches) == 1 else None
 
 
 WORD = re.compile(r'[^\W_]+', re.UNICODE)
 ANCHOR = re.compile(
-    r'(?<![\w@])(?:[\w.+%-]+@[\w.-]+\.[a-zа-я]{2,}|[a-zа-я]{1,12}[-_]?\d{2,}[a-zа-я\d-]*|'
+    r'(?<![\w@])(?:[\w.+%-]+@[\w.-]+\.[a-zа-я]{2,}|syn-[0-9a-f]{8,24}(?![-_])|[a-zа-я]{1,12}[-_]?\d{2,}[a-zа-я\d-]*|'
     r'\d{2,}[-_]?[a-zа-я]{1,12}[a-zа-я\d-]*|\d{5,})(?!\w)', re.I,
 )
 EXPLICIT_NUMBER = re.compile(r'(?:№\s*|\b(?:номер|заказ)\s*#?\s*)(\d{3,})\b', re.I)
@@ -578,6 +589,14 @@ def anchors(text):
     value = unicodedata.normalize('NFKC', text).translate(HYPHENS)
     numbered = {anchor_key(match[1]) for match in EXPLICIT_NUMBER.finditer(text)}
     return numbered | {anchor_key(match[0]) for match in ANCHOR.finditer(value)}
+
+
+def standalone_anchor(text):
+    value = normalized(text.strip()).translate(HYPHENS)
+    if ANCHOR.fullmatch(value):
+        return anchor_key(value)
+    explicit = EXPLICIT_NUMBER.fullmatch(value)
+    return anchor_key(explicit[1]) if explicit else None
 
 
 INTENTS = defaultdict(set)
@@ -786,6 +805,11 @@ class SearchEngine:
         scope = self.eligible(mailbox, after, before, as_of)
         if scope is not None and not scope:
             return []
+        # A lookup consisting of a single identifier has no fuzzy fallback:
+        # fragments of other identifiers would swamp the precise match.
+        literal = standalone_anchor(query) if mode == 'smart' and not period else None
+        if literal:
+            return self._lookup_anchor(literal, scope, limit)
         engine, indices = self, None
         if mode == 'smart' and self.dense is None and scope is not None and len(scope) < len(self.letters):
             indices, engine = self._visible_index((mailbox, after, before, as_of), scope)
@@ -794,6 +818,19 @@ class SearchEngine:
         if indices is None:
             return hits
         return [Hit(indices[h.index], h.score, h.evidence, h.signals) for h in hits]
+
+    def _lookup_anchor(self, anchor, scope, limit):
+        matching = self.anchor_index.get(anchor, set())
+        if scope is not None:
+            matching = matching & scope
+        indices = heapq.nlargest(limit, matching, key=lambda i: (self.dates[i], self.letters[i].date, -i))
+        hits = []
+        for i in indices:
+            letter = self.letters[i]
+            # An address or number may only be present in a header.
+            excerpt = next((text for text in (*self.passages[i], letter.subject, letter.sender) if anchor in anchors(text)), '')
+            hits.append(Hit(i, 1.0, clipped_evidence(excerpt, set(), {anchor}), ('Совпал номер или адрес',)))
+        return hits
 
     def _rank(self, query, mode, limit, scope, as_of, period):
         if mode == 'smart' and query.isascii() and not any(char.isdigit() for char in query) and '@' not in query:
@@ -1667,8 +1704,20 @@ function submitSearch() {
   refresh();
 }
 
-element('home').addEventListener('click', () => selectMailbox('', false, true));
-element('all-mail').addEventListener('click', () => selectMailbox('', false, true));
+function resetDates() {
+  element('after').value = '';
+  element('before').value = '';
+  element('as-of').value = state.meta?.reference_day || '';
+}
+
+function goToInbox() {
+  resetDates();
+  if (location.hash.startsWith('#search?')) history.replaceState(null, '', location.pathname + location.search);
+  selectMailbox('', false, true);
+}
+
+element('home').addEventListener('click', goToInbox);
+element('all-mail').addEventListener('click', goToInbox);
 element('saved-mail').addEventListener('click', () => selectMailbox('', true, true));
 element('search-form').addEventListener('submit', (event) => { event.preventDefault(); submitSearch(); });
 queryInput.addEventListener('search', () => { if (!queryInput.value && state.query) submitSearch(); });
@@ -1679,8 +1728,7 @@ element('filters-toggle').addEventListener('click', () => {
 });
 for (const id of ['after', 'before', 'as-of']) element(id).addEventListener('change', () => { state.page = 0; refresh(); });
 element('reset-filters').addEventListener('click', () => {
-  for (const id of ['after', 'before', 'as-of']) element(id).value = '';
-  element('as-of').value = state.meta?.reference_day || '';
+  resetDates();
   state.page = 0;
   refresh();
 });
@@ -1716,6 +1764,32 @@ document.addEventListener('keydown', (event) => {
   }
 });
 
+function restoreSearchLink(meta) {
+  const prefix = '#search?';
+  if (!location.hash.startsWith(prefix)) return;
+  const link = new URLSearchParams(location.hash.slice(prefix.length));
+  const query = (link.get('q') || '').trim();
+  const mailbox = link.get('mailbox') || '';
+  const asOf = link.get('as_of') || '';
+  const mode = link.get('mode') || 'smart';
+  if (!query || query.length > queryInput.maxLength ||
+      (mailbox && !meta.mailboxes.some(box => box.id === mailbox)) ||
+      !['smart', 'lexical', 'semantic'].includes(mode)) return;
+  const dateField = element('as-of');
+  if (asOf) {
+    dateField.value = asOf;
+    if (dateField.value !== asOf) {
+      resetDates();
+      return;
+    }
+    element('filters').hidden = false;
+    element('filters-toggle').setAttribute('aria-expanded', 'true');
+  }
+  queryInput.value = state.query = query;
+  state.mailbox = mailbox;
+  state.mode = mode;
+}
+
 async function init() {
   try {
     const { body } = await api('meta');
@@ -1730,6 +1804,7 @@ async function init() {
     element('source-label').textContent = body.demo ? 'Демонстрационные письма' : 'Архив хакатона';
     element('as-of').value = body.reference_day || '';
     element('semantic-mode').textContent = body.semantic ? 'По смыслу' : 'По теме';
+    restoreSearchLink(body);
     renderFolders();
     await refresh();
   } catch (error) {
