@@ -183,8 +183,28 @@ class Hit:
     signals: tuple[str, ...]
 
 
+def analyze_letter(letter):
+    texts = (letter.subject, letter.sender, letter.body)
+    aliases = {}
+    fields = []
+    for text in texts:
+        counts = Counter()
+        for word in words(text):
+            if word in STOP or len(word) < 2:
+                continue
+            key = stem(word)
+            counts[key] += 1
+            if len(word) >= 3 and all(char in RUSSIAN_ALPHABET for char in word):
+                alias = roman_key(word.translate(ROMAN))
+                if aliases.setdefault(alias, key) != key:
+                    aliases[alias] = None
+        fields.append(counts)
+    return (fields, tuple(map(lambda field: sum(field.values()), fields)), aliases,
+            anchors('\n'.join(texts)), events(set().union(*fields)), split_passages(letter.body))
+
+
 class SearchEngine:
-    def __init__(self, letters, encoder=None, cache=None):
+    def __init__(self, letters, encoder=None, cache=None, *, analysis=None):
         self.letters = tuple(letters)
         self.by_id = {letter.doc_id: i for i, letter in enumerate(letters)}
         self.dates = tuple(letter.day for letter in letters)
@@ -192,45 +212,32 @@ class SearchEngine:
         for i, letter in enumerate(letters):
             self.boxes[letter.mailbox_id].append(i)
         self.inbox = tuple(sorted(range(len(letters)), key=lambda i: (self.dates[i], letters[i].date, -i), reverse=True))
-        self.passages = [split_passages(letter.body) for letter in letters]
+        self.analysis = analysis if analysis is not None else tuple(map(analyze_letter, letters))
+        self.passages = []
         self.search_terms = defaultdict(list)
         self.doc_anchors = []
         self.anchor_index = defaultdict(set)
         self.doc_events = []
         self.event_index = defaultdict(set)
 
-        rows = []
         self.roman_terms = {}
         total_lengths = [0, 0, 0]
-        for i, letter in enumerate(letters):
-            texts = (letter.subject, letter.sender, letter.body)
-            fields = []
-            for text in texts:
-                counts = Counter()
-                for word in words(text):
-                    if word in STOP or len(word) < 2:
-                        continue
-                    key = stem(word)
-                    counts[key] += 1
-                    if len(word) >= 3 and all(char in RUSSIAN_ALPHABET for char in word):
-                        alias = roman_key(word.translate(ROMAN))
-                        if self.roman_terms.setdefault(alias, key) != key:
-                            self.roman_terms[alias] = None
-                fields.append(counts)
-            lengths = [sum(field.values()) for field in fields]
+        for i, (_, lengths, aliases, keys, doc_events, passages) in enumerate(self.analysis):
+            for alias, key in aliases.items():
+                if self.roman_terms.setdefault(alias, key) != key:
+                    self.roman_terms[alias] = None
             total_lengths = [total + length for total, length in zip(total_lengths, lengths)]
-            rows.append((fields, lengths))
-            self.doc_anchors.append(anchors('\n'.join(texts)))
-            for anchor in self.doc_anchors[-1]:
+            self.doc_anchors.append(keys)
+            for anchor in keys:
                 self.anchor_index[anchor].add(i)
-            doc_events = events(set().union(*fields))
             self.doc_events.append(doc_events)
             for event in doc_events:
                 self.event_index[event].add(i)
+            self.passages.append(passages)
 
         averages = [max(1, length / max(1, len(letters))) for length in total_lengths]
         weights = (2.6, 1.35, 1.0)
-        for i, (fields, lengths) in enumerate(rows):
+        for i, (fields, lengths, *_) in enumerate(self.analysis):
             effective = defaultdict(float)
             for field, length, average, weight in zip(fields, lengths, averages, weights):
                 scale = weight / (0.35 + 0.65 * length / average)
@@ -268,7 +275,8 @@ class SearchEngine:
                 self.snapshots.move_to_end(key)
                 return self.snapshots[key]
             indices = sorted(scope)
-            view = SearchEngine([self.letters[i] for i in indices])
+            view = SearchEngine([self.letters[i] for i in indices],
+                                analysis=tuple(self.analysis[i] for i in indices))
             self.snapshots[key] = (indices, view)
             while len(self.snapshots) > 1 and (len(self.snapshots) > 16 or
                     sum(len(v[0]) for v in self.snapshots.values()) > 8000):
