@@ -91,3 +91,17 @@ mark { background: #ffebad; color: inherit; }
   .letter { padding: 17px 20px 45px; }.letter-meta { flex-wrap: wrap; }.letter-meta time { font-size: 13px; }
 }
 @media (min-width: 761px) { .scrim { display: none; } }
+body[data-theme="sage"] { --blue:#276149; --tint:#dfefe6; background:#f1f6f2; }
+body[data-theme="plum"] { --blue:#773d7c; --tint:#f1e3f3; background:#f7f2f8; }
+body[data-theme] .nav-row.is-selected { color:var(--blue); background:var(--tint); }
+.color-blue { --mark:#4877b9; }.color-green { --mark:#388063; }.color-purple { --mark:#8253a4; }.color-orange { --mark:#b26924; }
+.mailboxes .nav-row::before,.label-link::before { border-color:var(--mark); }
+.label-link::before { content:''; display:block; width:11px; height:11px; margin:0 5px; border-radius:3px; background:var(--mark); }
+.tag { display:inline-block; color:var(--mark); border:1px solid currentColor; border-radius:4px; font-size:13px; padding:0 5px; }
+#preferences { margin-top:16px; color:var(--blue); }
+dialog { width:min(480px,94vw); border:1px solid var(--line); border-radius:14px; padding:24px; color:var(--ink); max-height:90dvh; }
+dialog::backdrop { background:#25314355; } dialog h2 { margin:0; } dialog p { color:var(--muted); font-size:14px; }
+dialog label,.personalize label { display:grid; gap:3px; font-size:14px; margin:8px 0; }
+dialog input,dialog select,.personalize input,.personalize select { font:inherit; background:white; border:1px solid #b7c2d0; border-radius:6px; padding:7px; }
+.dialog-actions,.personalize { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:20px; }
+.dialog-actions { justify-content:flex-end; }.primary { color:white; background:var(--blue); padding:8px 16px; border-radius:7px; }

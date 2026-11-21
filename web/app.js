@@ -29,6 +29,7 @@ function senderOf(item) {
 }
 
 function titleOf(item) {
+  if (prefs.subjects[item.doc_id]) return prefs.subjects[item.doc_id];
   return item.subject || (item.preview || item.body || '').trim().split('\n')[0].slice(0, 84) || 'Письмо без темы';
 }
 
@@ -95,6 +96,10 @@ async function openLetter(row, explicit = false) {
     element('letter-date').textContent = dateLabel(letter.date, longDate) || 'Дата неизвестна';
     element('letter-date').dateTime = letter.date.slice(0, 10);
     element('letter-body').textContent = letter.body || 'В письме нет текста.';
+    element('custom-subject').value = prefs.subjects[letter.doc_id] || '';
+    element('custom-subject').placeholder = letter.subject || 'Исходная тема';
+    fillLabels(element('message-label'), 'Без ярлыка', prefs.assigned[letter.doc_id] || '');
+    element('letter-box').textContent = boxTitle(letter.mailbox_id);
     element('evidence').hidden = !row.evidence;
     if (row.evidence) {
       highlight(element('evidence-text'), row.evidence, state.query);
@@ -134,6 +139,8 @@ function render(rows, emptyMessage) {
     const content = node('span', 'mail-text');
     content.append(node('span', 'subject', titleOf(item)),
       node('span', 'item-preview', item.evidence || item.preview || ''));
+    const label = prefs.labels[prefs.assigned[item.doc_id]];
+    if (label) content.prepend(node('span', 'tag color-' + label.color, label.name));
     button.append(avatar, node('span', 'sender', senderOf(item)), content, node('span', 'time', dateLabel(item.date, previewDate)));
     button.addEventListener('click', () => openLetter(item, true));
     fragment.append(button);
@@ -144,7 +151,7 @@ function render(rows, emptyMessage) {
 function navSelection() {
   const buttons = [element('all-mail'), element('saved-mail'), ...element('mailboxes').children];
   for (const button of buttons) {
-    const selected = button.id === 'saved-mail' ? state.saved : !state.saved && (button.dataset.box || '') === state.mailbox;
+    const selected = !state.label && (button.id === 'saved-mail' ? state.saved : !state.saved && (button.dataset.box || '') === state.mailbox);
     button.setAttribute('aria-pressed', String(selected));
     button.classList.toggle('is-selected', selected);
   }
@@ -152,11 +159,11 @@ function navSelection() {
 
 async function refresh() {
   const run = ++state.listRun;
-  const searching = Boolean(state.query && !state.saved);
+  const searching = Boolean(state.query && !state.saved && !state.label);
   const offset = state.page * pageSize;
   closeLetter();
   navSelection();
-  element('result-title').textContent = state.saved ? 'Избранное' : searching ? 'Результаты поиска' : state.mailbox || 'Входящие';
+  element('result-title').textContent = state.label ? prefs.labels[state.label].name : state.saved ? 'Избранное' : searching ? 'Результаты поиска' : boxTitle(state.mailbox) || 'Входящие';
   element('result-detail').textContent = 'Загрузка…';
   element('timing').hidden = true;
   element('modes').hidden = !searching;
@@ -167,8 +174,8 @@ async function refresh() {
     const filters = { mailbox: state.mailbox, after: element('after').value, before: element('before').value, as_of: element('as-of').value || state.meta?.reference_day };
     let result;
     let total;
-    if (state.saved) {
-      const ids = [...state.shortlist].reverse();
+    if (state.saved || state.label) {
+      const ids = state.label ? Object.keys(prefs.assigned).filter(id => prefs.assigned[id] === state.label) : [...state.shortlist].reverse();
       const items = await Promise.all(ids.slice(offset, offset + pageSize).map(async (id) => {
         try { const { body } = await api('letter', { id }); return { ...body, preview: body.body.slice(0, 260) }; }
         catch { return null; }
@@ -208,6 +215,7 @@ async function refresh() {
 }
 
 function selectMailbox(mailbox = '', saved = false, clear = false) {
+  state.label = '';
   toggleMenu(false);
   state.mailbox = mailbox;
   state.saved = saved;
@@ -217,6 +225,7 @@ function selectMailbox(mailbox = '', saved = false, clear = false) {
 }
 
 function submitSearch() {
+  state.label = '';
   toggleMenu(false);
   state.query = queryInput.value.trim();
   state.saved = false;
@@ -277,6 +286,7 @@ async function init() {
   try {
     const { body } = await api('meta');
     state.meta = body;
+    loadPrefs(body);
     state.storage = `context-shortlist-v1-${body.demo ? 'demo' : 'corpus'}`;
     try {
       const saved = JSON.parse(localStorage.getItem(state.storage) || '[]');
@@ -286,14 +296,7 @@ async function init() {
     element('source-label').textContent = body.demo ? 'Демонстрационный ящик' : 'Локальный почтовый корпус';
     element('as-of').value = body.reference_day || '';
     element('semantic-mode').textContent = body.semantic ? 'По смыслу' : 'По теме';
-    for (const { id, count } of body.mailboxes) {
-      const button = node('button', 'nav-row', id);
-      button.type = 'button';
-      button.dataset.box = id;
-      button.append(node('span', 'nav-count', number.format(count)));
-      button.addEventListener('click', () => selectMailbox(id));
-      element('mailboxes').append(button);
-    }
+    renderFolders();
     await refresh();
   } catch (error) {
     element('source-label').textContent = 'Сервис недоступен';
@@ -301,4 +304,90 @@ async function init() {
   }
 }
 
+const colors = {blue:'Синий', green:'Зелёный', purple:'Фиолетовый', orange:'Оранжевый'};
+let prefs = {boxes:{},labels:{},assigned:{},subjects:{},theme:'blue'};
+let prefsKey;
+function loadPrefs(meta) {
+  prefsKey = 'context-preferences-v1-' + JSON.stringify(meta.mailboxes.map(b => b.id));
+  try {
+    const saved = JSON.parse(localStorage.getItem(prefsKey));
+    if (saved) Object.assign(prefs, saved);
+  } catch { /* Defaults work when storage is unavailable. */ }
+  document.body.dataset.theme = prefs.theme;
+}
+function persist() {
+  try { localStorage.setItem(prefsKey, JSON.stringify(prefs)); } catch { /* Available for this session. */ }
+}
+function boxTitle(id) { return prefs.boxes[id]?.name || id; }
+function fillLabels(select, empty, selected) {
+  select.replaceChildren(new Option(empty, ''));
+  for (const [id,label] of Object.entries(prefs.labels)) select.add(new Option(label.name,id));
+  select.value = selected;
+}
+function renderFolders() {
+  const boxes = element('mailboxes'), labels = element('labels');
+  boxes.replaceChildren(); labels.replaceChildren();
+  for (const {id,count} of state.meta.mailboxes) {
+    const button = node('button', 'nav-row color-' + (prefs.boxes[id]?.color || 'blue'), boxTitle(id));
+    button.dataset.box = id; button.title = id;
+    button.append(node('span','nav-count',number.format(count)));
+    button.onclick = () => selectMailbox(id);
+    boxes.append(button);
+  }
+  for (const [id,label] of Object.entries(prefs.labels)) {
+    const button = node('button','nav-row label-link color-' + label.color,label.name);
+    button.onclick = () => {
+      toggleMenu(false); state.label=id; state.saved=false; state.page=0; state.query=''; queryInput.value=''; state.mailbox=''; refresh();
+    };
+    labels.append(button);
+  }
+}
+function showBoxSettings() {
+  const id = element('edit-box').value;
+  element('box-name').value = boxTitle(id);
+  element('box-color').value = prefs.boxes[id]?.color || 'blue';
+}
+function showLabelSettings() {
+  const label = prefs.labels[element('edit-label').value];
+  element('label-name').value = label?.name || '';
+  element('label-color').value = label?.color || 'blue';
+}
+for (const id of ['box-color','label-color']) {
+  for (const [key,name] of Object.entries(colors)) element(id).add(new Option(name,key));
+}
+element('preferences').onclick = () => {
+  if (!state.meta) return;
+  toggleMenu(false);
+  const select = element('edit-box');
+  select.replaceChildren(...state.meta.mailboxes.map(b => new Option(boxTitle(b.id),b.id)));
+  select.value = state.mailbox || state.meta.mailboxes[0].id;
+  showBoxSettings(); fillLabels(element('edit-label'),'Новый ярлык',state.label || '');
+  showLabelSettings(); element('theme').value = prefs.theme;
+  element('settings').showModal();
+};
+element('edit-box').onchange = showBoxSettings;
+element('edit-label').onchange = showLabelSettings;
+element('cancel-settings').onclick = () => element('settings').close();
+element('settings-form').onsubmit = event => {
+  event.preventDefault();
+  const id=element('edit-box').value;
+  prefs.boxes[id]={name:element('box-name').value.trim() || id,color:element('box-color').value};
+  const name=element('label-name').value.trim();
+  if (name) {
+    const key=element('edit-label').value || 'label-' + Date.now().toString(36);
+    prefs.labels[key]={name,color:element('label-color').value};
+  }
+  prefs.theme=element('theme').value; document.body.dataset.theme=prefs.theme;
+  persist(); renderFolders(); element('settings').close(); refresh();
+};
+element('message-label').onchange = event => {
+  if (event.target.value) prefs.assigned[state.open]=event.target.value;
+  else delete prefs.assigned[state.open];
+  persist(); state.page=0; refresh();
+};
+element('apply-subject').onclick = () => {
+  const text=element('custom-subject').value.trim();
+  if (text) prefs.subjects[state.open]=text; else delete prefs.subjects[state.open];
+  persist(); refresh();
+};
 init();

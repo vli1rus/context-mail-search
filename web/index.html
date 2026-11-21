@@ -35,6 +35,8 @@
         <button type="button" class="nav-row" id="saved-mail" aria-pressed="false"><svg><use href="#star-icon"/></svg>Избранное <span class="nav-count" id="saved-total"></span></button>
       </nav>
       <h2>Почтовые ящики</h2><nav id="mailboxes" class="mailboxes" aria-label="Ящики"></nav>
+      <h2>Ярлыки</h2><nav id="labels" aria-label="Мои ярлыки"></nav>
+      <button class="nav-row" id="preferences">Настроить почту</button>
       <small id="source-label">Загрузка…</small>
     </aside>
     <main class="surface">
@@ -56,8 +58,20 @@
         <div class="letter-meta"><span class="avatar" id="letter-avatar" aria-hidden="true"></span><div><strong id="letter-sender"></strong><div id="letter-box"></div></div><time id="letter-date"></time></div>
         <section class="evidence" id="evidence" hidden><h2>Найденный фрагмент</h2><p id="evidence-text"></p><small id="signals"></small></section>
         <div class="letter-body" id="letter-body"></div>
+        <div class="personalize"><label>Ярлык <select id="message-label"></select></label>
+          <label>Моя тема письма <input id="custom-subject" maxlength="100" placeholder="Исходная тема"></label><button class="text-action" id="apply-subject">Сохранить тему</button></div>
       </article>
     </main>
   </div>
+  <dialog id="settings"><form method="dialog" id="settings-form">
+    <h2>Настройки почты</h2><p>Письма объединены по идентификатору ящика из данных. Названия, ярлыки и оформление сохраняются в этом браузере.</p>
+    <label>Почтовый ящик<select id="edit-box"></select></label>
+    <label>Название ящика<input id="box-name" maxlength="50"></label>
+    <label>Цвет ящика<select id="box-color"></select></label>
+    <label>Оформление<select id="theme"><option value="blue">Синее</option><option value="sage">Шалфей</option><option value="plum">Слива</option></select></label>
+    <label>Ярлык<select id="edit-label"><option value="">Новый ярлык</option></select></label>
+    <label>Название ярлыка<input id="label-name" maxlength="45"></label><label>Цвет ярлыка<select id="label-color"></select></label>
+    <div class="dialog-actions"><button type="button" id="cancel-settings">Отмена</button><button class="primary" type="submit">Сохранить</button></div>
+  </form></dialog>
 </body>
 </html>
