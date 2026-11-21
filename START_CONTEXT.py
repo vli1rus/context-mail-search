@@ -643,8 +643,28 @@ class Hit:
     signals: tuple[str, ...]
 
 
+def analyze_letter(letter):
+    texts = (letter.subject, letter.sender, letter.body)
+    aliases = {}
+    fields = []
+    for text in texts:
+        counts = Counter()
+        for word in words(text):
+            if word in STOP or len(word) < 2:
+                continue
+            key = stem(word)
+            counts[key] += 1
+            if len(word) >= 3 and all(char in RUSSIAN_ALPHABET for char in word):
+                alias = roman_key(word.translate(ROMAN))
+                if aliases.setdefault(alias, key) != key:
+                    aliases[alias] = None
+        fields.append(counts)
+    return (fields, tuple(map(lambda field: sum(field.values()), fields)), aliases,
+            anchors('\n'.join(texts)), events(set().union(*fields)), split_passages(letter.body))
+
+
 class SearchEngine:
-    def __init__(self, letters, encoder=None, cache=None):
+    def __init__(self, letters, encoder=None, cache=None, *, analysis=None):
         self.letters = tuple(letters)
         self.by_id = {letter.doc_id: i for i, letter in enumerate(letters)}
         self.dates = tuple(letter.day for letter in letters)
@@ -652,45 +672,32 @@ class SearchEngine:
         for i, letter in enumerate(letters):
             self.boxes[letter.mailbox_id].append(i)
         self.inbox = tuple(sorted(range(len(letters)), key=lambda i: (self.dates[i], letters[i].date, -i), reverse=True))
-        self.passages = [split_passages(letter.body) for letter in letters]
+        self.analysis = analysis if analysis is not None else tuple(map(analyze_letter, letters))
+        self.passages = []
         self.search_terms = defaultdict(list)
         self.doc_anchors = []
         self.anchor_index = defaultdict(set)
         self.doc_events = []
         self.event_index = defaultdict(set)
 
-        rows = []
         self.roman_terms = {}
         total_lengths = [0, 0, 0]
-        for i, letter in enumerate(letters):
-            texts = (letter.subject, letter.sender, letter.body)
-            fields = []
-            for text in texts:
-                counts = Counter()
-                for word in words(text):
-                    if word in STOP or len(word) < 2:
-                        continue
-                    key = stem(word)
-                    counts[key] += 1
-                    if len(word) >= 3 and all(char in RUSSIAN_ALPHABET for char in word):
-                        alias = roman_key(word.translate(ROMAN))
-                        if self.roman_terms.setdefault(alias, key) != key:
-                            self.roman_terms[alias] = None
-                fields.append(counts)
-            lengths = [sum(field.values()) for field in fields]
+        for i, (_, lengths, aliases, keys, doc_events, passages) in enumerate(self.analysis):
+            for alias, key in aliases.items():
+                if self.roman_terms.setdefault(alias, key) != key:
+                    self.roman_terms[alias] = None
             total_lengths = [total + length for total, length in zip(total_lengths, lengths)]
-            rows.append((fields, lengths))
-            self.doc_anchors.append(anchors('\n'.join(texts)))
-            for anchor in self.doc_anchors[-1]:
+            self.doc_anchors.append(keys)
+            for anchor in keys:
                 self.anchor_index[anchor].add(i)
-            doc_events = events(set().union(*fields))
             self.doc_events.append(doc_events)
             for event in doc_events:
                 self.event_index[event].add(i)
+            self.passages.append(passages)
 
         averages = [max(1, length / max(1, len(letters))) for length in total_lengths]
         weights = (2.6, 1.35, 1.0)
-        for i, (fields, lengths) in enumerate(rows):
+        for i, (fields, lengths, *_) in enumerate(self.analysis):
             effective = defaultdict(float)
             for field, length, average, weight in zip(fields, lengths, averages, weights):
                 scale = weight / (0.35 + 0.65 * length / average)
@@ -727,7 +734,8 @@ class SearchEngine:
                 self.snapshots.move_to_end(key)
                 return self.snapshots[key]
             indices = sorted(scope)
-            view = SearchEngine([self.letters[i] for i in indices])
+            view = SearchEngine([self.letters[i] for i in indices],
+                                analysis=tuple(self.analysis[i] for i in indices))
             self.snapshots[key] = (indices, view)
             while len(self.snapshots) > 1 and (len(self.snapshots) > 16 or
                     sum(len(v[0]) for v in self.snapshots.values()) > 8000):
@@ -1120,10 +1128,11 @@ HTML = r'''<!doctype html>
     <symbol id="search-icon" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></symbol>
     <symbol id="tune-icon" viewBox="0 0 24 24"><path d="M3 7h5m5 0h8M3 17h9m5 0h4"/><circle cx="10.5" cy="7" r="2.5"/><circle cx="14.5" cy="17" r="2.5"/></symbol>
     <symbol id="menu-icon" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></symbol>
+    <symbol id="mail-icon" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m4 7 8 6 8-6"/></symbol>
   </svg>
   <header class="topbar">
     <div class="identity"><button class="icon-button menu" id="menu" aria-label="Ящики и папки" aria-expanded="false" aria-controls="folders"><svg><use href="#menu-icon"/></svg></button>
-      <button class="brand" id="home" aria-label="Почта — ко входящим"><b aria-hidden="true">@</b>Почта</button></div>
+      <button class="brand" id="home" aria-label="Почта — ко входящим"><svg aria-hidden="true"><use href="#mail-icon"/></svg>Почта</button></div>
     <form class="search" id="search-form" role="search">
       <button class="icon-button search-submit" type="submit" aria-label="Найти"><svg><use href="#search-icon"/></svg></button>
       <input id="query" type="search" aria-label="Поиск писем" maxlength="600" placeholder="Поиск по почте" autocomplete="off">
@@ -1142,7 +1151,8 @@ HTML = r'''<!doctype html>
         <button type="button" class="nav-row is-selected" id="all-mail" aria-pressed="true"><svg><use href="#inbox-icon"/></svg>Входящие <span class="nav-count" id="mail-total"></span></button>
         <button type="button" class="nav-row" id="saved-mail" aria-pressed="false"><svg><use href="#star-icon"/></svg>Избранное <span class="nav-count" id="saved-total"></span></button>
       </nav>
-      <h2>Почтовые ящики</h2><nav id="mailboxes" class="mailboxes" aria-label="Ящики"></nav>
+      <h2>Почтовые ящики</h2><button type="button" class="text-action" id="add-box" hidden>Добавить ящик</button>
+      <nav id="mailboxes" class="mailboxes" aria-label="Ящики"></nav>
       <h2>Ярлыки</h2><nav id="labels" aria-label="Мои ярлыки"></nav>
       <button class="nav-row" id="preferences">Настроить почту</button>
       <small id="source-label">Загрузка…</small>
@@ -1176,10 +1186,15 @@ HTML = r'''<!doctype html>
     <label>Почтовый ящик<select id="edit-box"></select></label>
     <label>Название ящика<input id="box-name" maxlength="50"></label>
     <label>Цвет ящика<select id="box-color"></select></label>
-    <label>Оформление<select id="theme"><option value="blue">Синее</option><option value="sage">Шалфей</option><option value="plum">Слива</option></select></label>
+    <label>Оформление<select id="theme"><option value="blue">Нейтральное</option><option value="sage">Шалфей</option><option value="plum">Слива</option></select></label>
     <label>Ярлык<select id="edit-label"><option value="">Новый ярлык</option></select></label>
     <label>Название ярлыка<input id="label-name" maxlength="45"></label><label>Цвет ярлыка<select id="label-color"></select></label>
     <div class="dialog-actions"><button type="button" id="cancel-settings">Отмена</button><button class="primary" type="submit">Сохранить</button></div>
+  </form></dialog>
+  <dialog id="new-box"><form method="dialog" id="new-box-form">
+    <h2>Новый ящик</h2><p id="new-box-hint"></p>
+    <label>Название<input id="new-box-name" maxlength="50" required autofocus></label>
+    <div class="dialog-actions"><button type="button" id="cancel-new-box">Отмена</button><button class="primary" type="submit">Добавить</button></div>
   </form></dialog>
 </body>
 </html>
@@ -1187,22 +1202,22 @@ HTML = r'''<!doctype html>
 
 
 CSS = r'''* { box-sizing: border-box; }
-:root { color-scheme: light; --ink: #202531; --muted: #596576; --blue: #145bcc; --tint: #e7f0ff; --line: #e7ebf0; font: 16px/1.5 Roboto, "Segoe UI", Arial, sans-serif; }
-body { margin: 0; color: var(--ink); background: #f6f8fb; }
+:root { color-scheme: light; --ink: #202321; --muted: #5a625e; --blue: #364640; --tint: #e7ebe8; --line: #e1e4e2; font: 16px/1.5 "Segoe UI", Arial, sans-serif; }
+body { margin: 0; color: var(--ink); background: #f5f6f5; }
 button, input { font: inherit; color: inherit; }
 button { border: 0; cursor: pointer; background: transparent; }
 button:focus-visible, input:focus-visible { outline: 3px solid #487ee4; outline-offset: 2px; }
 button:disabled { opacity: .35; cursor: default; }
 [hidden], .symbols { display: none !important; }
 svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; flex: 0 0 auto; }
-.topbar { display: grid; grid-template-columns: 238px minmax(0, 780px); align-items: center; min-height: 88px; gap: 20px; padding: 12px 30px 12px 22px; }
+.topbar { display: grid; grid-template-columns: 238px minmax(0, 720px); align-items: center; min-height: 76px; gap: 20px; padding: 10px 30px 10px 22px; background: #fff; border-bottom: 1px solid var(--line); }
 .identity, .brand, .icon-button, .nav-row, .letter-meta, .letter-tools, .pagination, .filters, .modes, .results-head { display: flex; align-items: center; }
-.brand { padding: 2px 10px; gap: 9px; font-size: 28px; font-weight: 650; letter-spacing: -.9px; }
-.brand b { font: 700 40px/1 Arial,sans-serif; letter-spacing: -3px; color: var(--blue); margin-right: 2px; }
+.brand { padding: 6px 10px; gap: 10px; font-size: 21px; font-weight: 650; border-radius: 5px; }
+.brand:hover { background: var(--tint); }
 .icon-button, .pagination button { width: 42px; height: 42px; justify-content: center; border-radius: 8px; color: #4a596c; }
 .icon-button:hover, .pagination button:enabled:hover, .text-action:hover { background: #e6ebf2; }
 .menu { display: none; }
-.search { display: flex; align-items: center; gap: 5px; padding: 3px 6px; min-width: 0; border: 1px solid transparent; background: #e9edf3; border-radius: 12px; }
+.search { display: flex; align-items: center; gap: 5px; padding: 2px 6px; min-width: 0; border: 1px solid var(--line); background: #f6f7f6; border-radius: 6px; }
 .search:focus-within { background: white; border-color: #87a7dc; }
 .search input { flex: 1; width: 0; border: 0; background: transparent; font-size: 18px; padding: 7px 0; outline: none; }
 .search input:focus-visible { outline: none; }
@@ -1210,17 +1225,17 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-lineca
 .filters { margin: 0 30px 14px 280px; gap: 18px; flex-wrap: wrap; }
 .filters label { font-size: 14px; color: var(--muted); }
 .filters input { display: block; border: 1px solid #c7d0db; background: white; border-radius: 7px; padding: 5px; min-width: 0; }
-.layout { display: grid; grid-template-columns: 238px minmax(0, 1fr); gap: 20px; padding: 0 22px 22px; }
+.layout { display: grid; grid-template-columns: 238px minmax(0, 1fr); gap: 20px; padding: 18px 22px 22px; }
 .sidebar { display: flex; flex-direction: column; padding: 12px 0 18px; align-self: start; min-height: calc(100dvh - 112px); }
 .nav-row { gap: 13px; width: 100%; min-height: 45px; padding: 7px 16px; border-radius: 8px; text-align: left; overflow-wrap: anywhere; font-size: 16px; }
-.nav-row:hover { background: #eaf0f6; }
-.nav-row.is-selected { background: #dfeaff; color: #104eaa; font-weight: 650; }
+.nav-row:hover { background: #eaedea; }
+.nav-row.is-selected { background: var(--tint); color: var(--blue); font-weight: 650; }
 .nav-count { margin-left: auto; font-size: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .is-selected .nav-count { color: inherit; }
 .sidebar h2 { font-size: 14px; font-weight: 600; color: var(--muted); margin: 32px 16px 8px; }
 .mailboxes .nav-row::before { content: ''; width: 9px; height: 9px; border: 2px solid #8292a8; border-radius: 50%; margin: 0 5px; flex-shrink: 0; }
 .sidebar small { color: var(--muted); font-size: 13px; margin: auto 16px 0; padding-top: 35px; }
-.surface { border: 1px solid var(--line); border-radius: 15px; background: white; min-height: calc(100dvh - 110px); min-width: 0; overflow: clip; }
+.surface { border: 1px solid var(--line); border-radius: 6px; background: white; min-height: calc(100dvh - 116px); min-width: 0; overflow: clip; }
 .results-head { gap: 12px; justify-content: space-between; padding: 30px 36px 21px; border-bottom: 1px solid var(--line); }
 h1 { font-size: clamp(28px, 2.5vw, 38px); line-height: 1.2; margin: 0; letter-spacing: -.8px; font-weight: 620; overflow-wrap: anywhere; }
 #result-detail { color: var(--muted); margin: 5px 0 0; font-size: 15px; overflow-wrap: anywhere; }
@@ -1228,10 +1243,9 @@ h1 { font-size: clamp(28px, 2.5vw, 38px); line-height: 1.2; margin: 0; letter-sp
 .pagination button { font-size: 27px; line-height: 1; }
 .pagination span { margin-right: 7px; }
 .mail-item { width: 100%; display: grid; grid-template-columns: 44px minmax(120px, .8fr) minmax(200px, 2.35fr) auto; gap: 18px; align-items: center; text-align: left; padding: 17px 35px; border-bottom: 1px solid var(--line); min-height: 81px; }
-.mail-item:hover { background: #f5f8fc; }
+.mail-item:hover { background: #f6f8f6; }
 .mail-item:focus-visible { outline-offset: -3px; }
-.avatar { display: inline-grid; place-items: center; flex-shrink: 0; width: 42px; height: 42px; background: #e2eafb; color: #31598d; border-radius: 50%; font-size: 16px; font-weight: 650; }
-.tone-1 { background: #e5efe7; color: #356348; }.tone-2 { background: #f5e8dd; color: #825733; }.tone-3 { background: #eae5f4; color: #675185; }.tone-4 { background: #deedef; color: #366770; }
+.avatar { display: inline-grid; place-items: center; flex-shrink: 0; width: 38px; height: 38px; background: #eef0ee; color: #4c5751; border-radius: 6px; font-size: 15px; font-weight: 650; }
 .sender, .subject, .item-preview { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .sender { font-weight: 590; font-size: 16px; }
 .subject { font-size: 18px; line-height: 1.45; font-weight: 580; }
@@ -1239,7 +1253,7 @@ h1 { font-size: clamp(28px, 2.5vw, 38px); line-height: 1.2; margin: 0; letter-sp
 .time { white-space: nowrap; font-variant-numeric: tabular-nums; font-size: 14px; }
 .modes { padding: 12px 32px; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
 .modes button, .text-action { font-size: 15px; padding: 8px 12px; border-radius: 7px; }
-.modes button[aria-pressed="true"], .text-action[aria-pressed="true"] { background: var(--tint); color: #134b9a; }
+.modes button[aria-pressed="true"], .text-action[aria-pressed="true"] { background: var(--tint); color: var(--blue); }
 .modes button:hover { background: #eff3f8; }
 .timing { margin-left: auto; color: var(--muted); font-size: 14px; }
 .empty-items { padding: 48px 36px; color: var(--muted); }
@@ -1264,7 +1278,7 @@ mark { background: #ffebad; color: inherit; }
 }
 @media (max-width: 760px) {
   .topbar { grid-template-columns: auto minmax(0,1fr); padding: 12px; min-height: 68px; gap: 10px; }
-  .brand { font-size: 0; padding: 0 2px; }.brand b { font-size: 31px; }
+  .brand { font-size: 0; padding: 5px; }
   .menu { display: flex; }.icon-button { width: 36px; }
   .layout { display: block; padding: 0; }.surface { min-height: calc(100dvh - 68px); border-radius: 0; border-inline: 0; }
   .sidebar { display: none; }.layout.nav-open .sidebar { display: flex; position: fixed; inset: 0 auto 0 0; width: min(285px,82vw); background: #f6f8fb; z-index: 3; padding: 28px 14px; overflow-y: auto; }
@@ -1287,6 +1301,8 @@ body[data-theme] .nav-row.is-selected { color:var(--blue); background:var(--tint
 .label-link::before { content:''; display:block; width:11px; height:11px; margin:0 5px; border-radius:3px; background:var(--mark); }
 .tag { display:inline-block; color:var(--mark); border:1px solid currentColor; border-radius:4px; font-size:13px; padding:0 5px; }
 #preferences { margin-top:16px; color:var(--blue); }
+#add-box { align-self:flex-start; margin:0 4px 6px; }
+.mailboxes { max-height: 46vh; overflow-y: auto; }
 dialog { width:min(480px,94vw); border:1px solid var(--line); border-radius:14px; padding:24px; color:var(--ink); max-height:90dvh; }
 dialog::backdrop { background:#25314355; } dialog h2 { margin:0; } dialog p { color:var(--muted); font-size:14px; }
 dialog label,.personalize label { display:grid; gap:3px; font-size:14px; margin:8px 0; }
@@ -1303,10 +1319,11 @@ const list = element('items');
 const queryInput = element('query');
 const layout = element('layout');
 const pageSize = 18;
+const customMailboxLimit = 7;
 const number = new Intl.NumberFormat('ru-RU');
 const previewDate = new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'short', timeZone: 'UTC' });
 const longDate = new Intl.DateTimeFormat('ru-RU', { dateStyle: 'long', timeZone: 'UTC' });
-const state = { mailbox: '', saved: false, mode: 'smart', query: '', page: 0, open: null, listRun: 0, letterRun: 0,
+const state = { mailbox: '', saved: false, mode: 'smart', query: '', page: 0, open: null, openedRow: null, editedLetter: false, listRun: 0, letterRun: 0,
   meta: null, storage: '', shortlist: new Set() };
 
 function node(tag, className, text) {
@@ -1358,6 +1375,8 @@ function closeLetter(returnFocus = false) {
   const lastOpen = state.open;
   state.letterRun++;
   state.open = null;
+  state.openedRow = null;
+  state.editedLetter = false;
   element('letter').hidden = true;
   layout.classList.remove('reading');
   refreshSelection();
@@ -1365,6 +1384,15 @@ function closeLetter(returnFocus = false) {
     const button = [...list.querySelectorAll('.mail-item')].find(item => item.dataset.doc === lastOpen);
     button?.focus();
   }
+}
+
+function returnToList() {
+  if (!state.editedLetter) {
+    closeLetter(true);
+    return;
+  }
+  const docId = state.open;
+  refresh().then(() => [...list.querySelectorAll('.mail-item')].find(item => item.dataset.doc === docId)?.focus());
 }
 
 function highlight(container, text, query) {
@@ -1385,6 +1413,7 @@ async function openLetter(row, explicit = false) {
     const { body: letter } = await api('letter', { id: row.doc_id });
     if (run !== state.letterRun) return;
     state.open = letter.doc_id;
+    state.openedRow = row;
     element('letter').hidden = false;
     element('letter-subject').textContent = titleOf({ ...letter, preview: row.subject ? '' : row.preview });
     element('letter-sender').textContent = senderOf(letter);
@@ -1464,7 +1493,7 @@ async function refresh() {
   element('result-title').textContent = state.label ? prefs.labels[state.label].name : state.saved ? 'Избранное' : searching ? 'Результаты поиска' : boxTitle(state.mailbox) || 'Входящие';
   element('result-detail').textContent = 'Загрузка…';
   element('timing').hidden = true;
-  element('modes').hidden = !searching;
+  element('modes').hidden = !searching || isCustomMailbox(state.mailbox);
   element('pagination').hidden = true;
   for (const button of element('modes').querySelectorAll('button')) button.setAttribute('aria-pressed', String(button.dataset.mode === state.mode));
   list.replaceChildren();
@@ -1479,6 +1508,8 @@ async function refresh() {
         catch { return null; }
       }));
       result = { body: { items: items.filter(Boolean), total: ids.length } };
+    } else if (isCustomMailbox(state.mailbox)) {
+      result = { body: { items: [] } };
     } else if (searching) {
       result = await api('search', { ...filters, q: state.query, mode: state.mode, limit: 40 });
     } else {
@@ -1551,7 +1582,7 @@ element('reset-filters').addEventListener('click', () => {
 for (const button of element('modes').querySelectorAll('button')) button.addEventListener('click', () => {
   if (state.mode !== button.dataset.mode) { state.mode = button.dataset.mode; refresh(); }
 });
-element('back').addEventListener('click', () => closeLetter(true));
+element('back').addEventListener('click', returnToList);
 element('prev').addEventListener('click', () => { if (state.page > 0) { state.page--; refresh(); } });
 element('next').addEventListener('click', () => { state.page++; refresh(); });
 element('save').addEventListener('click', () => {
@@ -1572,9 +1603,9 @@ element('scrim').addEventListener('click', () => toggleMenu(false));
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
     if (layout.classList.contains('nav-open')) { toggleMenu(false); element('menu').focus(); }
-    else if (state.open) closeLetter(true);
+    else if (state.open && !document.querySelector('dialog[open]')) returnToList();
   }
-  if (event.key === '/' && !event.altKey && !event.ctrlKey && !event.metaKey && !event.target.matches('input, textarea, [contenteditable]')) {
+  if (event.key === '/' && !document.querySelector('dialog[open]') && !event.altKey && !event.ctrlKey && !event.metaKey && !event.target.matches('input, textarea, [contenteditable]')) {
     event.preventDefault();
     queryInput.focus();
   }
@@ -1591,7 +1622,7 @@ async function init() {
       if (Array.isArray(saved)) state.shortlist = new Set(saved.filter(id => typeof id === 'string'));
     } catch { /* The browser may disable local storage. */ }
     element('mail-total').textContent = number.format(body.count);
-    element('source-label').textContent = body.demo ? 'Демонстрационный ящик' : 'Локальный почтовый корпус';
+    element('source-label').textContent = body.demo ? 'Демонстрационные письма' : 'Архив хакатона';
     element('as-of').value = body.reference_day || '';
     element('semantic-mode').textContent = body.semantic ? 'По смыслу' : 'По теме';
     renderFolders();
@@ -1603,7 +1634,7 @@ async function init() {
 }
 
 const colors = {blue:'Синий', green:'Зелёный', purple:'Фиолетовый', orange:'Оранжевый'};
-let prefs = {boxes:{},labels:{},assigned:{},subjects:{},theme:'blue'};
+let prefs = {boxes:{},customBoxes:{},labels:{},assigned:{},subjects:{},theme:'blue'};
 let prefsKey;
 function loadPrefs(meta) {
   prefsKey = 'context-preferences-v1-' + JSON.stringify(meta.mailboxes.map(b => b.id));
@@ -1616,7 +1647,11 @@ function loadPrefs(meta) {
 function persist() {
   try { localStorage.setItem(prefsKey, JSON.stringify(prefs)); } catch { /* Available for this session. */ }
 }
-function boxTitle(id) { return prefs.boxes[id]?.name || id; }
+function isCustomMailbox(id) { return Object.hasOwn(prefs.customBoxes, id); }
+function boxTitle(id) { return prefs.boxes[id]?.name || prefs.customBoxes[id]?.name || id; }
+function mailboxRows() {
+  return [...state.meta.mailboxes, ...Object.keys(prefs.customBoxes).map(id => ({id, count:0}))];
+}
 function fillLabels(select, empty, selected) {
   select.replaceChildren(new Option(empty, ''));
   for (const [id,label] of Object.entries(prefs.labels)) select.add(new Option(label.name,id));
@@ -1625,7 +1660,11 @@ function fillLabels(select, empty, selected) {
 function renderFolders() {
   const boxes = element('mailboxes'), labels = element('labels');
   boxes.replaceChildren(); labels.replaceChildren();
-  for (const {id,count} of state.meta.mailboxes) {
+  const add = element('add-box');
+  add.hidden = false;
+  add.disabled = Object.keys(prefs.customBoxes).length >= customMailboxLimit;
+  add.textContent = add.disabled ? 'Добавлено 7 ящиков' : 'Добавить ящик';
+  for (const {id,count} of mailboxRows()) {
     const button = node('button', 'nav-row color-' + (prefs.boxes[id]?.color || 'blue'), boxTitle(id));
     button.dataset.box = id; button.title = id;
     button.append(node('span','nav-count',number.format(count)));
@@ -1657,8 +1696,9 @@ element('preferences').onclick = () => {
   if (!state.meta) return;
   toggleMenu(false);
   const select = element('edit-box');
-  select.replaceChildren(...state.meta.mailboxes.map(b => new Option(boxTitle(b.id),b.id)));
-  select.value = state.mailbox || state.meta.mailboxes[0].id;
+  const mailboxes = mailboxRows();
+  select.replaceChildren(...mailboxes.map(b => new Option(boxTitle(b.id),b.id)));
+  select.value = state.mailbox || mailboxes[0]?.id || '';
   showBoxSettings(); fillLabels(element('edit-label'),'Новый ярлык',state.label || '');
   showLabelSettings(); element('theme').value = prefs.theme;
   element('settings').showModal();
@@ -1666,10 +1706,37 @@ element('preferences').onclick = () => {
 element('edit-box').onchange = showBoxSettings;
 element('edit-label').onchange = showLabelSettings;
 element('cancel-settings').onclick = () => element('settings').close();
+element('add-box').onclick = () => {
+  const input = element('new-box-name');
+  input.value = '';
+  input.setCustomValidity('');
+  element('new-box-hint').textContent = 'Ящик создаётся пустым и сохраняется в этом браузере.';
+  element('new-box').showModal();
+};
+element('cancel-new-box').onclick = () => element('new-box').close();
+element('new-box-name').oninput = event => event.target.setCustomValidity('');
+element('new-box-form').onsubmit = event => {
+  event.preventDefault();
+  if (Object.keys(prefs.customBoxes).length >= customMailboxLimit) return;
+  const input = element('new-box-name');
+  const name = input.value.trim();
+  if (!name) {
+    input.setCustomValidity('Введите название ящика.');
+    input.reportValidity();
+    return;
+  }
+  let id = 'local-1';
+  for (let index = 2; mailboxRows().some(box => box.id === id); index++) id = 'local-' + index;
+  prefs.customBoxes[id] = {name};
+  persist();
+  renderFolders();
+  element('new-box').close();
+  selectMailbox(id, false, true);
+};
 element('settings-form').onsubmit = event => {
   event.preventDefault();
   const id=element('edit-box').value;
-  prefs.boxes[id]={name:element('box-name').value.trim() || id,color:element('box-color').value};
+  if (id) prefs.boxes[id]={name:element('box-name').value.trim() || prefs.customBoxes[id]?.name || id,color:element('box-color').value};
   const name=element('label-name').value.trim();
   if (name) {
     const key=element('edit-label').value || 'label-' + Date.now().toString(36);
@@ -1681,12 +1748,16 @@ element('settings-form').onsubmit = event => {
 element('message-label').onchange = event => {
   if (event.target.value) prefs.assigned[state.open]=event.target.value;
   else delete prefs.assigned[state.open];
-  persist(); state.page=0; refresh();
+  persist();
+  state.editedLetter = true;
 };
 element('apply-subject').onclick = () => {
   const text=element('custom-subject').value.trim();
   if (text) prefs.subjects[state.open]=text; else delete prefs.subjects[state.open];
-  persist(); refresh();
+  persist();
+  state.editedLetter = true;
+  if (text) element('letter-subject').textContent = text;
+  else if (state.openedRow) openLetter(state.openedRow);
 };
 init();
 '''
