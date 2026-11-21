@@ -5,10 +5,11 @@ const list = element('items');
 const queryInput = element('query');
 const layout = element('layout');
 const pageSize = 18;
+const customMailboxLimit = 7;
 const number = new Intl.NumberFormat('ru-RU');
 const previewDate = new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'short', timeZone: 'UTC' });
 const longDate = new Intl.DateTimeFormat('ru-RU', { dateStyle: 'long', timeZone: 'UTC' });
-const state = { mailbox: '', saved: false, mode: 'smart', query: '', page: 0, open: null, listRun: 0, letterRun: 0,
+const state = { mailbox: '', saved: false, mode: 'smart', query: '', page: 0, open: null, openedRow: null, editedLetter: false, listRun: 0, letterRun: 0,
   meta: null, storage: '', shortlist: new Set() };
 
 function node(tag, className, text) {
@@ -60,6 +61,8 @@ function closeLetter(returnFocus = false) {
   const lastOpen = state.open;
   state.letterRun++;
   state.open = null;
+  state.openedRow = null;
+  state.editedLetter = false;
   element('letter').hidden = true;
   layout.classList.remove('reading');
   refreshSelection();
@@ -67,6 +70,15 @@ function closeLetter(returnFocus = false) {
     const button = [...list.querySelectorAll('.mail-item')].find(item => item.dataset.doc === lastOpen);
     button?.focus();
   }
+}
+
+function returnToList() {
+  if (!state.editedLetter) {
+    closeLetter(true);
+    return;
+  }
+  const docId = state.open;
+  refresh().then(() => [...list.querySelectorAll('.mail-item')].find(item => item.dataset.doc === docId)?.focus());
 }
 
 function highlight(container, text, query) {
@@ -87,6 +99,7 @@ async function openLetter(row, explicit = false) {
     const { body: letter } = await api('letter', { id: row.doc_id });
     if (run !== state.letterRun) return;
     state.open = letter.doc_id;
+    state.openedRow = row;
     element('letter').hidden = false;
     element('letter-subject').textContent = titleOf({ ...letter, preview: row.subject ? '' : row.preview });
     element('letter-sender').textContent = senderOf(letter);
@@ -166,7 +179,7 @@ async function refresh() {
   element('result-title').textContent = state.label ? prefs.labels[state.label].name : state.saved ? 'Избранное' : searching ? 'Результаты поиска' : boxTitle(state.mailbox) || 'Входящие';
   element('result-detail').textContent = 'Загрузка…';
   element('timing').hidden = true;
-  element('modes').hidden = !searching;
+  element('modes').hidden = !searching || isCustomMailbox(state.mailbox);
   element('pagination').hidden = true;
   for (const button of element('modes').querySelectorAll('button')) button.setAttribute('aria-pressed', String(button.dataset.mode === state.mode));
   list.replaceChildren();
@@ -181,6 +194,8 @@ async function refresh() {
         catch { return null; }
       }));
       result = { body: { items: items.filter(Boolean), total: ids.length } };
+    } else if (isCustomMailbox(state.mailbox)) {
+      result = { body: { items: [] } };
     } else if (searching) {
       result = await api('search', { ...filters, q: state.query, mode: state.mode, limit: 40 });
     } else {
@@ -253,7 +268,7 @@ element('reset-filters').addEventListener('click', () => {
 for (const button of element('modes').querySelectorAll('button')) button.addEventListener('click', () => {
   if (state.mode !== button.dataset.mode) { state.mode = button.dataset.mode; refresh(); }
 });
-element('back').addEventListener('click', () => closeLetter(true));
+element('back').addEventListener('click', returnToList);
 element('prev').addEventListener('click', () => { if (state.page > 0) { state.page--; refresh(); } });
 element('next').addEventListener('click', () => { state.page++; refresh(); });
 element('save').addEventListener('click', () => {
@@ -274,9 +289,9 @@ element('scrim').addEventListener('click', () => toggleMenu(false));
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
     if (layout.classList.contains('nav-open')) { toggleMenu(false); element('menu').focus(); }
-    else if (state.open) closeLetter(true);
+    else if (state.open && !document.querySelector('dialog[open]')) returnToList();
   }
-  if (event.key === '/' && !event.altKey && !event.ctrlKey && !event.metaKey && !event.target.matches('input, textarea, [contenteditable]')) {
+  if (event.key === '/' && !document.querySelector('dialog[open]') && !event.altKey && !event.ctrlKey && !event.metaKey && !event.target.matches('input, textarea, [contenteditable]')) {
     event.preventDefault();
     queryInput.focus();
   }
@@ -293,7 +308,7 @@ async function init() {
       if (Array.isArray(saved)) state.shortlist = new Set(saved.filter(id => typeof id === 'string'));
     } catch { /* The browser may disable local storage. */ }
     element('mail-total').textContent = number.format(body.count);
-    element('source-label').textContent = body.demo ? 'Демонстрационный ящик' : 'Локальный почтовый корпус';
+    element('source-label').textContent = body.demo ? 'Демонстрационные письма' : 'Архив хакатона';
     element('as-of').value = body.reference_day || '';
     element('semantic-mode').textContent = body.semantic ? 'По смыслу' : 'По теме';
     renderFolders();
@@ -305,7 +320,7 @@ async function init() {
 }
 
 const colors = {blue:'Синий', green:'Зелёный', purple:'Фиолетовый', orange:'Оранжевый'};
-let prefs = {boxes:{},labels:{},assigned:{},subjects:{},theme:'blue'};
+let prefs = {boxes:{},customBoxes:{},labels:{},assigned:{},subjects:{},theme:'blue'};
 let prefsKey;
 function loadPrefs(meta) {
   prefsKey = 'context-preferences-v1-' + JSON.stringify(meta.mailboxes.map(b => b.id));
@@ -318,7 +333,11 @@ function loadPrefs(meta) {
 function persist() {
   try { localStorage.setItem(prefsKey, JSON.stringify(prefs)); } catch { /* Available for this session. */ }
 }
-function boxTitle(id) { return prefs.boxes[id]?.name || id; }
+function isCustomMailbox(id) { return Object.hasOwn(prefs.customBoxes, id); }
+function boxTitle(id) { return prefs.boxes[id]?.name || prefs.customBoxes[id]?.name || id; }
+function mailboxRows() {
+  return [...state.meta.mailboxes, ...Object.keys(prefs.customBoxes).map(id => ({id, count:0}))];
+}
 function fillLabels(select, empty, selected) {
   select.replaceChildren(new Option(empty, ''));
   for (const [id,label] of Object.entries(prefs.labels)) select.add(new Option(label.name,id));
@@ -327,7 +346,11 @@ function fillLabels(select, empty, selected) {
 function renderFolders() {
   const boxes = element('mailboxes'), labels = element('labels');
   boxes.replaceChildren(); labels.replaceChildren();
-  for (const {id,count} of state.meta.mailboxes) {
+  const add = element('add-box');
+  add.hidden = false;
+  add.disabled = Object.keys(prefs.customBoxes).length >= customMailboxLimit;
+  add.textContent = add.disabled ? 'Добавлено 7 ящиков' : 'Добавить ящик';
+  for (const {id,count} of mailboxRows()) {
     const button = node('button', 'nav-row color-' + (prefs.boxes[id]?.color || 'blue'), boxTitle(id));
     button.dataset.box = id; button.title = id;
     button.append(node('span','nav-count',number.format(count)));
@@ -359,8 +382,9 @@ element('preferences').onclick = () => {
   if (!state.meta) return;
   toggleMenu(false);
   const select = element('edit-box');
-  select.replaceChildren(...state.meta.mailboxes.map(b => new Option(boxTitle(b.id),b.id)));
-  select.value = state.mailbox || state.meta.mailboxes[0].id;
+  const mailboxes = mailboxRows();
+  select.replaceChildren(...mailboxes.map(b => new Option(boxTitle(b.id),b.id)));
+  select.value = state.mailbox || mailboxes[0]?.id || '';
   showBoxSettings(); fillLabels(element('edit-label'),'Новый ярлык',state.label || '');
   showLabelSettings(); element('theme').value = prefs.theme;
   element('settings').showModal();
@@ -368,10 +392,37 @@ element('preferences').onclick = () => {
 element('edit-box').onchange = showBoxSettings;
 element('edit-label').onchange = showLabelSettings;
 element('cancel-settings').onclick = () => element('settings').close();
+element('add-box').onclick = () => {
+  const input = element('new-box-name');
+  input.value = '';
+  input.setCustomValidity('');
+  element('new-box-hint').textContent = 'Ящик создаётся пустым и сохраняется в этом браузере.';
+  element('new-box').showModal();
+};
+element('cancel-new-box').onclick = () => element('new-box').close();
+element('new-box-name').oninput = event => event.target.setCustomValidity('');
+element('new-box-form').onsubmit = event => {
+  event.preventDefault();
+  if (Object.keys(prefs.customBoxes).length >= customMailboxLimit) return;
+  const input = element('new-box-name');
+  const name = input.value.trim();
+  if (!name) {
+    input.setCustomValidity('Введите название ящика.');
+    input.reportValidity();
+    return;
+  }
+  let id = 'local-1';
+  for (let index = 2; mailboxRows().some(box => box.id === id); index++) id = 'local-' + index;
+  prefs.customBoxes[id] = {name};
+  persist();
+  renderFolders();
+  element('new-box').close();
+  selectMailbox(id, false, true);
+};
 element('settings-form').onsubmit = event => {
   event.preventDefault();
   const id=element('edit-box').value;
-  prefs.boxes[id]={name:element('box-name').value.trim() || id,color:element('box-color').value};
+  if (id) prefs.boxes[id]={name:element('box-name').value.trim() || prefs.customBoxes[id]?.name || id,color:element('box-color').value};
   const name=element('label-name').value.trim();
   if (name) {
     const key=element('edit-label').value || 'label-' + Date.now().toString(36);
@@ -383,11 +434,15 @@ element('settings-form').onsubmit = event => {
 element('message-label').onchange = event => {
   if (event.target.value) prefs.assigned[state.open]=event.target.value;
   else delete prefs.assigned[state.open];
-  persist(); state.page=0; refresh();
+  persist();
+  state.editedLetter = true;
 };
 element('apply-subject').onclick = () => {
   const text=element('custom-subject').value.trim();
   if (text) prefs.subjects[state.open]=text; else delete prefs.subjects[state.open];
-  persist(); refresh();
+  persist();
+  state.editedLetter = true;
+  if (text) element('letter-subject').textContent = text;
+  else if (state.openedRow) openLetter(state.openedRow);
 };
 init();

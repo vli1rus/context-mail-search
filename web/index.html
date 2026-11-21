@@ -12,10 +12,11 @@
     <symbol id="search-icon" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></symbol>
     <symbol id="tune-icon" viewBox="0 0 24 24"><path d="M3 7h5m5 0h8M3 17h9m5 0h4"/><circle cx="10.5" cy="7" r="2.5"/><circle cx="14.5" cy="17" r="2.5"/></symbol>
     <symbol id="menu-icon" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></symbol>
+    <symbol id="mail-icon" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m4 7 8 6 8-6"/></symbol>
   </svg>
   <header class="topbar">
     <div class="identity"><button class="icon-button menu" id="menu" aria-label="Ящики и папки" aria-expanded="false" aria-controls="folders"><svg><use href="#menu-icon"/></svg></button>
-      <button class="brand" id="home" aria-label="Почта — ко входящим"><b aria-hidden="true">@</b>Почта</button></div>
+      <button class="brand" id="home" aria-label="Почта — ко входящим"><svg aria-hidden="true"><use href="#mail-icon"/></svg>Почта</button></div>
     <form class="search" id="search-form" role="search">
       <button class="icon-button search-submit" type="submit" aria-label="Найти"><svg><use href="#search-icon"/></svg></button>
       <input id="query" type="search" aria-label="Поиск писем" maxlength="600" placeholder="Поиск по почте" autocomplete="off">
@@ -34,7 +35,8 @@
         <button type="button" class="nav-row is-selected" id="all-mail" aria-pressed="true"><svg><use href="#inbox-icon"/></svg>Входящие <span class="nav-count" id="mail-total"></span></button>
         <button type="button" class="nav-row" id="saved-mail" aria-pressed="false"><svg><use href="#star-icon"/></svg>Избранное <span class="nav-count" id="saved-total"></span></button>
       </nav>
-      <h2>Почтовые ящики</h2><nav id="mailboxes" class="mailboxes" aria-label="Ящики"></nav>
+      <h2>Почтовые ящики</h2><button type="button" class="text-action" id="add-box" hidden>Добавить ящик</button>
+      <nav id="mailboxes" class="mailboxes" aria-label="Ящики"></nav>
       <h2>Ярлыки</h2><nav id="labels" aria-label="Мои ярлыки"></nav>
       <button class="nav-row" id="preferences">Настроить почту</button>
       <small id="source-label">Загрузка…</small>
@@ -68,10 +70,15 @@
     <label>Почтовый ящик<select id="edit-box"></select></label>
     <label>Название ящика<input id="box-name" maxlength="50"></label>
     <label>Цвет ящика<select id="box-color"></select></label>
-    <label>Оформление<select id="theme"><option value="blue">Синее</option><option value="sage">Шалфей</option><option value="plum">Слива</option></select></label>
+    <label>Оформление<select id="theme"><option value="blue">Нейтральное</option><option value="sage">Шалфей</option><option value="plum">Слива</option></select></label>
     <label>Ярлык<select id="edit-label"><option value="">Новый ярлык</option></select></label>
     <label>Название ярлыка<input id="label-name" maxlength="45"></label><label>Цвет ярлыка<select id="label-color"></select></label>
     <div class="dialog-actions"><button type="button" id="cancel-settings">Отмена</button><button class="primary" type="submit">Сохранить</button></div>
+  </form></dialog>
+  <dialog id="new-box"><form method="dialog" id="new-box-form">
+    <h2>Новый ящик</h2><p id="new-box-hint"></p>
+    <label>Название<input id="new-box-name" maxlength="50" required autofocus></label>
+    <div class="dialog-actions"><button type="button" id="cancel-new-box">Отмена</button><button class="primary" type="submit">Добавить</button></div>
   </form></dialog>
 </body>
 </html>
