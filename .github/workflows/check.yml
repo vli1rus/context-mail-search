@@ -26,8 +26,12 @@ jobs:
       - name: Build and exercise the server container
         run: |
           docker build -t context-mail .
-          docker run -d --name inbox-ci -p 127.0.0.1:8877:8765 context-mail
-          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8877/api/meta | python -c "import json,sys; assert json.load(sys.stdin)['count']==30"
+          docker run -d --name inbox-ci -p 127.0.0.1:8877:8765 context-mail --demo
+          if ! curl -fsS --max-time 3 --retry 15 --retry-delay 1 --retry-all-errors http://127.0.0.1:8877/api/meta -o /tmp/context-container-meta.json; then
+            docker logs inbox-ci
+            exit 1
+          fi
+          python -c "import json; data=json.load(open('/tmp/context-container-meta.json')); assert data['demo'] and data['count']==30"
           python -m mailsearch.loadtest --base-url http://127.0.0.1:8877 --repeat 2 --workers 4
       - uses: actions/upload-artifact@v4
         with:
