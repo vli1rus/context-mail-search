@@ -11,6 +11,10 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-lineca
 .identity, .brand, .icon-button, .nav-row, .letter-meta, .letter-tools, .pagination, .filters, .modes, .results-head { display: flex; align-items: center; }
 .brand { padding: 6px 10px; gap: 10px; font-size: 21px; font-weight: 650; border-radius: 5px; }
 .brand:hover { background: var(--tint); }
+.mail-mark { display: grid; place-items: center; position: relative; width: 34px; height: 28px; flex: 0 0 34px; border-radius: 8px; border: 1px solid #d5a933; background: #ffda70; }
+.mail-mark::before { content: ''; position: absolute; left: 6px; right: 6px; top: 8px; border-top: 2px solid #292619; }
+.mail-mark span { position: absolute; left: 7px; top: 6px; width: 8px; height: 7px; border-radius: 2px; background: #292619; box-shadow: 10px 0 #292619; }
+.mail-mark::after { content: ''; position: absolute; width: 8px; height: 5px; bottom: 5px; border-bottom: 2px solid #292619; border-radius: 0 0 50% 50%; }
 .icon-button, .pagination button { width: 42px; height: 42px; justify-content: center; border-radius: 8px; color: #4a596c; }
 .icon-button:hover, .pagination button:enabled:hover, .text-action:hover { background: #e6ebf2; }
 .menu { display: none; }
