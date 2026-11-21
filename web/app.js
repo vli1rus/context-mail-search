@@ -320,15 +320,20 @@ async function init() {
 }
 
 const colors = {blue:'Синий', green:'Зелёный', purple:'Фиолетовый', orange:'Оранжевый'};
+const themes = new Set(['blue', 'sage', 'plum']);
 let prefs = {boxes:{},customBoxes:{},labels:{},assigned:{},subjects:{},theme:'blue'};
 let prefsKey;
+function applyTheme(theme) {
+  document.body.dataset.theme = themes.has(theme) ? theme : 'blue';
+}
 function loadPrefs(meta) {
   prefsKey = 'context-preferences-v1-' + JSON.stringify(meta.mailboxes.map(b => b.id));
   try {
     const saved = JSON.parse(localStorage.getItem(prefsKey));
     if (saved) Object.assign(prefs, saved);
   } catch { /* Defaults work when storage is unavailable. */ }
-  document.body.dataset.theme = prefs.theme;
+  if (!themes.has(prefs.theme)) prefs.theme = 'blue';
+  applyTheme(prefs.theme);
 }
 function persist() {
   try { localStorage.setItem(prefsKey, JSON.stringify(prefs)); } catch { /* Available for this session. */ }
@@ -391,6 +396,8 @@ element('preferences').onclick = () => {
 };
 element('edit-box').onchange = showBoxSettings;
 element('edit-label').onchange = showLabelSettings;
+element('theme').onchange = event => applyTheme(event.target.value);
+element('settings').addEventListener('close', () => applyTheme(prefs.theme));
 element('cancel-settings').onclick = () => element('settings').close();
 element('add-box').onclick = () => {
   const input = element('new-box-name');
@@ -428,7 +435,8 @@ element('settings-form').onsubmit = event => {
     const key=element('edit-label').value || 'label-' + Date.now().toString(36);
     prefs.labels[key]={name,color:element('label-color').value};
   }
-  prefs.theme=element('theme').value; document.body.dataset.theme=prefs.theme;
+  prefs.theme=element('theme').value;
+  applyTheme(prefs.theme);
   persist(); renderFolders(); element('settings').close(); refresh();
 };
 element('message-label').onchange = event => {
