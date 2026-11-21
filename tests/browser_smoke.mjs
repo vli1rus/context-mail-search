@@ -39,6 +39,27 @@ try {
     await page.locator('#saved-mail').click();
     await page.locator('.mail-item[data-doc="f-401"]').waitFor();
     assert.deepEqual(errors, []);
+    if (width < 760) await page.getByRole('button', {name: 'Ящики и папки'}).click();
+    await page.locator('#preferences').click();
+    await page.locator('#edit-box').selectOption('Поездки');
+    await page.locator('#box-name').fill('Командировки');
+    await page.locator('#theme').selectOption('sage');
+    await page.locator('#label-name').fill('Важное');
+    await page.locator('#label-color').selectOption('orange');
+    await page.locator('#settings-form button[type=submit]').click();
+    await page.reload();
+    if (width < 760) await page.getByRole('button', {name: 'Ящики и папки'}).click();
+    await page.getByRole('button',{name:/Командировки/}).click();
+    assert.equal(await page.locator('body').getAttribute('data-theme'),'sage');
+    await page.locator('.mail-item').first().click();
+    await page.locator('#message-label').selectOption({label:'Важное'});
+    if (width < 760) await page.getByRole('button', {name: 'Ящики и папки'}).click();
+    await page.getByRole('button',{name:'Важное',exact:true}).click();
+    await page.locator('.mail-item').first().click();
+    await page.locator('#custom-subject').fill('Мой маршрут');
+    await page.locator('#apply-subject').click();
+    await page.getByText('Мой маршрут',{exact:true}).waitFor();
+    assert.deepEqual(errors, []);
     await page.close();
     console.log('PASS browser viewport ' + width);
   }
