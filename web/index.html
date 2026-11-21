@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Почта · Контекст</title>
+  <link rel="stylesheet" href="/styles.css"><script src="/app.js" defer></script>
+</head>
+<body>
+  <svg class="symbols" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="inbox-icon" viewBox="0 0 24 24"><path d="m3 14 3-9h12l3 9v5H3z M3 14h5l2 3h4l2-3h5"/></symbol>
+    <symbol id="star-icon" viewBox="0 0 24 24"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9z"/></symbol>
+    <symbol id="search-icon" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></symbol>
+    <symbol id="tune-icon" viewBox="0 0 24 24"><path d="M3 7h5m5 0h8M3 17h9m5 0h4"/><circle cx="10.5" cy="7" r="2.5"/><circle cx="14.5" cy="17" r="2.5"/></symbol>
+    <symbol id="menu-icon" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></symbol>
+  </svg>
+  <header class="topbar">
+    <div class="identity"><button class="icon-button menu" id="menu" aria-label="Ящики и папки" aria-expanded="false" aria-controls="folders"><svg><use href="#menu-icon"/></svg></button>
+      <button class="brand" id="home" aria-label="Почта — ко входящим"><b aria-hidden="true">@</b>Почта</button></div>
+    <form class="search" id="search-form" role="search">
+      <button class="icon-button search-submit" type="submit" aria-label="Найти"><svg><use href="#search-icon"/></svg></button>
+      <input id="query" type="search" aria-label="Поиск писем" maxlength="600" placeholder="Поиск по почте" autocomplete="off">
+      <button class="icon-button" id="filters-toggle" type="button" aria-label="Фильтры поиска" title="Фильтры поиска" aria-expanded="false" aria-controls="filters"><svg><use href="#tune-icon"/></svg></button>
+    </form>
+  </header>
+  <section class="filters" id="filters" aria-label="Фильтры поиска" hidden>
+    <label>Получено с<input type="date" id="after"></label><label>По<input type="date" id="before"></label>
+    <label>Дата поиска<input type="date" id="as-of"></label>
+    <button type="button" id="reset-filters" class="text-action">Сбросить</button>
+  </section>
+  <div class="layout" id="layout">
+    <button id="scrim" class="scrim" aria-label="Закрыть список ящиков" hidden></button>
+    <aside class="sidebar" id="folders" aria-label="Папки и ящики">
+      <nav aria-label="Папки">
+        <button type="button" class="nav-row is-selected" id="all-mail" aria-pressed="true"><svg><use href="#inbox-icon"/></svg>Входящие <span class="nav-count" id="mail-total"></span></button>
+        <button type="button" class="nav-row" id="saved-mail" aria-pressed="false"><svg><use href="#star-icon"/></svg>Избранное <span class="nav-count" id="saved-total"></span></button>
+      </nav>
+      <h2>Почтовые ящики</h2><nav id="mailboxes" class="mailboxes" aria-label="Ящики"></nav>
+      <small id="source-label">Загрузка…</small>
+    </aside>
+    <main class="surface">
+      <section class="results" aria-labelledby="result-title">
+        <div class="results-head"><div><h1 id="result-title">Входящие</h1><p id="result-detail" role="status">Загружаем письма…</p></div>
+          <div class="pagination" id="pagination" hidden><span id="pages"></span><button id="prev" aria-label="Предыдущая страница">‹</button><button id="next" aria-label="Следующая страница">›</button></div>
+        </div>
+        <div id="modes" class="modes" role="group" aria-label="Режим поиска" hidden>
+          <button type="button" data-mode="smart" aria-pressed="true">Умный поиск</button>
+          <button type="button" data-mode="lexical" aria-pressed="false">По словам</button>
+          <button type="button" data-mode="semantic" id="semantic-mode" aria-pressed="false">По теме</button>
+          <span class="timing" id="timing" hidden></span>
+        </div>
+        <div class="items" id="items"></div>
+      </section>
+      <article class="letter" id="letter" hidden aria-labelledby="letter-subject">
+        <div class="letter-tools"><button class="text-action" id="back">← К списку</button><button type="button" class="text-action" id="save" aria-pressed="false">В избранное</button></div>
+        <h1 id="letter-subject"></h1>
+        <div class="letter-meta"><span class="avatar" id="letter-avatar" aria-hidden="true"></span><div><strong id="letter-sender"></strong><div id="letter-box"></div></div><time id="letter-date"></time></div>
+        <section class="evidence" id="evidence" hidden><h2>Найденный фрагмент</h2><p id="evidence-text"></p><small id="signals"></small></section>
+        <div class="letter-body" id="letter-body"></div>
+      </article>
+    </main>
+  </div>
+</body>
+</html>
