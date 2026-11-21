@@ -1,0 +1,30 @@
+name: Check mail search
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install 'numpy>=2,<3'
+      - run: python -m unittest discover -s tests -v
+      - run: python build_standalone.py && git diff --exit-code START_CONTEXT.py
+      - run: python -m mailsearch.evaluate --demo --mode smart --export-k 10 --output /tmp/demo-ranking.jsonl
+      - run: node --check web/app.js && npm install --no-save playwright@1.56.1 && npx playwright install --with-deps chromium
+      - run: node tests/browser_smoke.mjs
+      - name: Full HTTP latency on the demonstration mailbox
+        run: |
+          python -u START_CONTEXT.py --demo --no-browser --port 8765 > /tmp/context.log &
+          trap 'kill $!' EXIT
+          curl -sSf --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8765/api/meta
+          python -m mailsearch.loadtest --repeat 10 --workers 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mailbox-screens
+          path: /tmp/context-inbox-*.png
+          retention-days: 1
