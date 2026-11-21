@@ -4,7 +4,7 @@ permissions:
   contents: read
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -23,6 +23,12 @@ jobs:
           trap 'kill $!' EXIT
           curl -sSf --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8765/api/meta
           python -m mailsearch.loadtest --repeat 10 --workers 4
+      - name: Build and exercise the server container
+        run: |
+          docker build -t context-mail .
+          docker run -d --name inbox-ci -p 127.0.0.1:8877:8765 context-mail
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8877/api/meta | python -c "import json,sys; assert json.load(sys.stdin)['count']==30"
+          python -m mailsearch.loadtest --base-url http://127.0.0.1:8877 --repeat 2 --workers 4
       - uses: actions/upload-artifact@v4
         with:
           name: mailbox-screens
