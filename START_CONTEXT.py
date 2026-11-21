@@ -596,6 +596,39 @@ def events(keys):
     return set().union(*(INTENTS.get(key, set()) for key in keys))
 
 
+# Short topical requests need stricter evidence than the event dictionary
+# used for questions. Keep ambiguous words such as "отправление" out of the
+# primary evidence and require two distinct signals in the same passage.
+TOPICAL_PROFILES = (
+    ('курьер курьерский курьерская',
+     'курьер курьерский курьерская курьером курьеров курьеру',
+     'посылка отправление заказ пакет',
+     'доставил доставят доставим привезли привезут вручение вручит передадим доставлен отгрузить',
+     'Курьерская доставка'),
+    ('аптека медицина лекарство медикамент лекарства медикаменты',
+     'аптека аптечный рецепт рецептурный лекарство медикамент фармацевт фармацевтический больница поликлиника госпитализация',
+     'дозировка препарат таблетка вакцина капсула врач пациент медицинский',
+     'приём лечение назначение дозировка прививка вакцинация обследование диагноз приёмный',
+     'Лекарства и медицина'),
+    ('самолёт авиация авиарейс аэропорт',
+     'самолёт самолётом авиарейс авиакомпания авиабилет аэропорт',
+     'посадка борт рейс вылет',
+     'регистрация аэропорт терминал экипаж взлёт улетит прилёт',
+     'Авиация'),
+)
+
+
+def compile_profiles():
+    result = {}
+    for triggers, primary, context, actions, label in TOPICAL_PROFILES:
+        profile = (set(terms(primary)), set(terms(context)), set(terms(actions)), label)
+        result.update((key, profile) for key in terms(triggers))
+    return result
+
+
+SHORT_TOPICS = compile_profiles()
+
+
 def split_passages(text, size=64, overlap=16):
     if not text:
         return ['']
@@ -786,6 +819,10 @@ class SearchEngine:
         if period and not (query_terms - {'письм', 'письма', 'письмам', 'уведомлен'}):
             return [Hit(i, 1.0, self.letters[i].body[:330], ('Совпала дата',))
                     for i in self.inbox if scope is None or i in scope][:limit]
+        if mode != 'lexical' and len(query_terms) == 1 and not query_anchors:
+            topic = SHORT_TOPICS.get(next(iter(query_terms)))
+            if topic:
+                return self._rank_topic(query_terms, topic, limit, scope)
         lexical = defaultdict(float)
         for term in sorted(query_terms):
             idf = self.idf.get(term, 0)
@@ -866,6 +903,40 @@ class SearchEngine:
             evidence = clipped_evidence(passage or self.letters[i].subject, query_terms, query_anchors)
             hits.append(Hit(i, scores[i], evidence, tuple(sorted(signals[i]))))
         return hits
+
+    def _rank_topic(self, query_terms, topic, limit, scope):
+        primary, context, actions, label = topic
+        # Every accepted passage needs at least one of these indexed terms.
+        candidates = {i for key in primary | context for i, _ in self.search_terms.get(key, ())}
+        if scope is not None:
+            candidates &= scope
+        ranked = []
+        for i in candidates:
+            fields = self.analysis[i][0]
+            subject = self.letters[i].subject
+            all_keys = set(fields[0]) | set(fields[2])
+            if not (all_keys & primary or (all_keys & context and all_keys & actions)):
+                continue
+            best = (0, '', set())
+            for passage in [subject, *self.passages[i]]:
+                keys = set(terms(passage))
+                exact = keys & query_terms
+                direct = keys & primary
+                paired = any(a != b for a in keys & context for b in keys & actions)
+                if not direct and not paired:
+                    continue
+                score = (9 * bool(exact) + 4 * bool(direct) + 2 * paired
+                         + min(3, len(keys & (primary | context | actions))))
+                if score > best[0]:
+                    best = (score, passage, keys)
+            if best[0]:
+                ranked.append((best[0], i, best[1], best[2]))
+        return [
+            Hit(i, score, clipped_evidence(passage, keys & (primary | context | actions), set()),
+                (label, 'По словам') if keys & query_terms else (label,))
+            for score, i, passage, keys in heapq.nlargest(
+                limit, ranked, key=lambda item: (item[0], self.dates[item[1]], -item[1]))
+        ]
 
 
 # evaluate.py
@@ -1132,7 +1203,7 @@ HTML = r'''<!doctype html>
   </svg>
   <header class="topbar">
     <div class="identity"><button class="icon-button menu" id="menu" aria-label="Ящики и папки" aria-expanded="false" aria-controls="folders"><svg><use href="#menu-icon"/></svg></button>
-      <button class="brand" id="home" aria-label="Почта — ко входящим"><svg aria-hidden="true"><use href="#mail-icon"/></svg>Почта</button></div>
+      <button class="brand" id="home" aria-label="Контекст — ко входящим"><span class="mail-mark" aria-hidden="true"><span></span></span>Контекст</button></div>
     <form class="search" id="search-form" role="search">
       <button class="icon-button search-submit" type="submit" aria-label="Найти"><svg><use href="#search-icon"/></svg></button>
       <input id="query" type="search" aria-label="Поиск писем" maxlength="600" placeholder="Поиск по почте" autocomplete="off">
@@ -1203,22 +1274,43 @@ HTML = r'''<!doctype html>
 
 CSS = r'''* { box-sizing: border-box; }
 :root { color-scheme: light; --ink: #202321; --muted: #5a625e; --blue: #364640; --tint: #e7ebe8; --line: #e1e4e2; font: 16px/1.5 "Segoe UI", Arial, sans-serif; }
-body { margin: 0; color: var(--ink); background: #f5f6f5; }
+body {
+  --page-bg: #f5f6f5;
+  --header-bg: #fff;
+  --drawer-bg: #f6f8fb;
+  --search-bg: #f6f7f6;
+  --row-hover: #f6f8f6;
+  --nav-hover: #eaedea;
+  --control-hover: #e6ebf2;
+  --mode-hover: #eff3f8;
+  --focus: #487ee4;
+  --field-border: #b7c2d0;
+  --search-focus: #87a7dc;
+  --evidence-border: #96b7ed;
+  --evidence-title: #315a8c;
+  margin: 0;
+  color: var(--ink);
+  background: var(--page-bg);
+}
 button, input { font: inherit; color: inherit; }
 button { border: 0; cursor: pointer; background: transparent; }
-button:focus-visible, input:focus-visible { outline: 3px solid #487ee4; outline-offset: 2px; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
 button:disabled { opacity: .35; cursor: default; }
 [hidden], .symbols { display: none !important; }
 svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; flex: 0 0 auto; }
-.topbar { display: grid; grid-template-columns: 238px minmax(0, 720px); align-items: center; min-height: 76px; gap: 20px; padding: 10px 30px 10px 22px; background: #fff; border-bottom: 1px solid var(--line); }
+.topbar { display: grid; grid-template-columns: 238px minmax(0, 720px); align-items: center; min-height: 76px; gap: 20px; padding: 10px 30px 10px 22px; background: var(--header-bg); border-bottom: 1px solid var(--line); }
 .identity, .brand, .icon-button, .nav-row, .letter-meta, .letter-tools, .pagination, .filters, .modes, .results-head { display: flex; align-items: center; }
 .brand { padding: 6px 10px; gap: 10px; font-size: 21px; font-weight: 650; border-radius: 5px; }
 .brand:hover { background: var(--tint); }
+.mail-mark { display: grid; place-items: center; position: relative; width: 34px; height: 28px; flex: 0 0 34px; border-radius: 8px; border: 1px solid #d5a933; background: #ffda70; }
+.mail-mark::before { content: ''; position: absolute; left: 6px; right: 6px; top: 8px; border-top: 2px solid #292619; }
+.mail-mark span { position: absolute; left: 7px; top: 6px; width: 8px; height: 7px; border-radius: 2px; background: #292619; box-shadow: 10px 0 #292619; }
+.mail-mark::after { content: ''; position: absolute; width: 8px; height: 5px; bottom: 5px; border-bottom: 2px solid #292619; border-radius: 0 0 50% 50%; }
 .icon-button, .pagination button { width: 42px; height: 42px; justify-content: center; border-radius: 8px; color: #4a596c; }
-.icon-button:hover, .pagination button:enabled:hover, .text-action:hover { background: #e6ebf2; }
+.icon-button:hover, .pagination button:enabled:hover, .text-action:hover { background: var(--control-hover); }
 .menu { display: none; }
-.search { display: flex; align-items: center; gap: 5px; padding: 2px 6px; min-width: 0; border: 1px solid var(--line); background: #f6f7f6; border-radius: 6px; }
-.search:focus-within { background: white; border-color: #87a7dc; }
+.search { display: flex; align-items: center; gap: 5px; padding: 2px 6px; min-width: 0; border: 1px solid var(--line); background: var(--search-bg); border-radius: 6px; }
+.search:focus-within { background: white; border-color: var(--search-focus); }
 .search input { flex: 1; width: 0; border: 0; background: transparent; font-size: 18px; padding: 7px 0; outline: none; }
 .search input:focus-visible { outline: none; }
 .search input::placeholder { color: #536072; opacity: 1; }
@@ -1228,7 +1320,7 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-lineca
 .layout { display: grid; grid-template-columns: 238px minmax(0, 1fr); gap: 20px; padding: 18px 22px 22px; }
 .sidebar { display: flex; flex-direction: column; padding: 12px 0 18px; align-self: start; min-height: calc(100dvh - 112px); }
 .nav-row { gap: 13px; width: 100%; min-height: 45px; padding: 7px 16px; border-radius: 8px; text-align: left; overflow-wrap: anywhere; font-size: 16px; }
-.nav-row:hover { background: #eaedea; }
+.nav-row:hover { background: var(--nav-hover); }
 .nav-row.is-selected { background: var(--tint); color: var(--blue); font-weight: 650; }
 .nav-count { margin-left: auto; font-size: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .is-selected .nav-count { color: inherit; }
@@ -1243,7 +1335,7 @@ h1 { font-size: clamp(28px, 2.5vw, 38px); line-height: 1.2; margin: 0; letter-sp
 .pagination button { font-size: 27px; line-height: 1; }
 .pagination span { margin-right: 7px; }
 .mail-item { width: 100%; display: grid; grid-template-columns: 44px minmax(120px, .8fr) minmax(200px, 2.35fr) auto; gap: 18px; align-items: center; text-align: left; padding: 17px 35px; border-bottom: 1px solid var(--line); min-height: 81px; }
-.mail-item:hover { background: #f6f8f6; }
+.mail-item:hover { background: var(--row-hover); }
 .mail-item:focus-visible { outline-offset: -3px; }
 .avatar { display: inline-grid; place-items: center; flex-shrink: 0; width: 38px; height: 38px; background: #eef0ee; color: #4c5751; border-radius: 6px; font-size: 15px; font-weight: 650; }
 .sender, .subject, .item-preview { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
@@ -1254,7 +1346,7 @@ h1 { font-size: clamp(28px, 2.5vw, 38px); line-height: 1.2; margin: 0; letter-sp
 .modes { padding: 12px 32px; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
 .modes button, .text-action { font-size: 15px; padding: 8px 12px; border-radius: 7px; }
 .modes button[aria-pressed="true"], .text-action[aria-pressed="true"] { background: var(--tint); color: var(--blue); }
-.modes button:hover { background: #eff3f8; }
+.modes button:hover { background: var(--mode-hover); }
 .timing { margin-left: auto; color: var(--muted); font-size: 14px; }
 .empty-items { padding: 48px 36px; color: var(--muted); }
 .reading .results { display: none; }
@@ -1265,8 +1357,8 @@ h1 { font-size: clamp(28px, 2.5vw, 38px); line-height: 1.2; margin: 0; letter-sp
 .letter-meta > div { min-width: 0; overflow-wrap: anywhere; }
 .letter-meta time { margin-left: auto; color: var(--muted); font-size: 14px; }
 #letter-box, .evidence small { color: var(--muted); font-size: 14px; }
-.evidence { margin: 28px 0; padding: 3px 16px; border-left: 3px solid #96b7ed; }
-.evidence h2 { font-size: 15px; color: #315a8c; margin: 0; }
+.evidence { margin: 28px 0; padding: 3px 16px; border-left: 3px solid var(--evidence-border); }
+.evidence h2 { font-size: 15px; color: var(--evidence-title); margin: 0; }
 .evidence p { margin: 6px 0; overflow-wrap: anywhere; }
 mark { background: #ffebad; color: inherit; }
 .letter-body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 18px; line-height: 1.7; border-top: 1px solid var(--line); padding-top: 26px; }
@@ -1281,7 +1373,7 @@ mark { background: #ffebad; color: inherit; }
   .brand { font-size: 0; padding: 5px; }
   .menu { display: flex; }.icon-button { width: 36px; }
   .layout { display: block; padding: 0; }.surface { min-height: calc(100dvh - 68px); border-radius: 0; border-inline: 0; }
-  .sidebar { display: none; }.layout.nav-open .sidebar { display: flex; position: fixed; inset: 0 auto 0 0; width: min(285px,82vw); background: #f6f8fb; z-index: 3; padding: 28px 14px; overflow-y: auto; }
+  .sidebar { display: none; }.layout.nav-open .sidebar { display: flex; position: fixed; inset: 0 auto 0 0; width: min(285px,82vw); background: var(--drawer-bg); z-index: 3; padding: 28px 14px; overflow-y: auto; }
   .scrim { position: fixed; inset: 0; width: 100%; height: 100%; background: #1c283c55; z-index: 2; }
   .filters { margin: 0 14px 12px; gap: 12px; }.search input { font-size: 16px; }
   .results-head { padding: 24px 17px 16px; }.pagination span { display: none; }
@@ -1293,9 +1385,22 @@ mark { background: #ffebad; color: inherit; }
   .letter { padding: 17px 20px 45px; }.letter-meta { flex-wrap: wrap; }.letter-meta time { font-size: 13px; }
 }
 @media (min-width: 761px) { .scrim { display: none; } }
-body[data-theme="sage"] { --blue:#276149; --tint:#dfefe6; background:#f1f6f2; }
-body[data-theme="plum"] { --blue:#773d7c; --tint:#f1e3f3; background:#f7f2f8; }
-body[data-theme] .nav-row.is-selected { color:var(--blue); background:var(--tint); }
+body[data-theme="sage"] {
+  --blue: #276149; --tint: #dfefe6; --line: #cbdcd0;
+  --page-bg: #e8f1ea; --header-bg: #d7e9dd; --drawer-bg: #e8f1ea;
+  --search-bg: #f3f9f4; --row-hover: #eff7f1; --nav-hover: #dbeade;
+  --control-hover: #cfe3d5; --mode-hover: #e5f1e8;
+  --focus: #37745a; --field-border: #8daf9a; --search-focus: #61957a;
+  --evidence-border: #8fbfa0; --evidence-title: #276149;
+}
+body[data-theme="plum"] {
+  --blue: #703b76; --tint: #f1e3f3; --line: #e1d1e4;
+  --page-bg: #f3eaf5; --header-bg: #ead9ee; --drawer-bg: #f3eaf5;
+  --search-bg: #fbf6fc; --row-hover: #faf3fb; --nav-hover: #efdfef;
+  --control-hover: #e3cce8; --mode-hover: #f3e6f5;
+  --focus: #825087; --field-border: #b89cbd; --search-focus: #9f74a5;
+  --evidence-border: #c59acb; --evidence-title: #703b76;
+}
 .color-blue { --mark:#4877b9; }.color-green { --mark:#388063; }.color-purple { --mark:#8253a4; }.color-orange { --mark:#b26924; }
 .mailboxes .nav-row::before,.label-link::before { border-color:var(--mark); }
 .label-link::before { content:''; display:block; width:11px; height:11px; margin:0 5px; border-radius:3px; background:var(--mark); }
@@ -1306,7 +1411,7 @@ body[data-theme] .nav-row.is-selected { color:var(--blue); background:var(--tint
 dialog { width:min(480px,94vw); border:1px solid var(--line); border-radius:14px; padding:24px; color:var(--ink); max-height:90dvh; }
 dialog::backdrop { background:#25314355; } dialog h2 { margin:0; } dialog p { color:var(--muted); font-size:14px; }
 dialog label,.personalize label { display:grid; gap:3px; font-size:14px; margin:8px 0; }
-dialog input,dialog select,.personalize input,.personalize select { font:inherit; background:white; border:1px solid #b7c2d0; border-radius:6px; padding:7px; }
+dialog input,dialog select,.personalize input,.personalize select { font:inherit; background:white; border:1px solid var(--field-border); border-radius:6px; padding:7px; }
 .dialog-actions,.personalize { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:20px; }
 .dialog-actions { justify-content:flex-end; }.primary { color:white; background:var(--blue); padding:8px 16px; border-radius:7px; }
 '''
@@ -1634,15 +1739,20 @@ async function init() {
 }
 
 const colors = {blue:'Синий', green:'Зелёный', purple:'Фиолетовый', orange:'Оранжевый'};
+const themes = new Set(['blue', 'sage', 'plum']);
 let prefs = {boxes:{},customBoxes:{},labels:{},assigned:{},subjects:{},theme:'blue'};
 let prefsKey;
+function applyTheme(theme) {
+  document.body.dataset.theme = themes.has(theme) ? theme : 'blue';
+}
 function loadPrefs(meta) {
   prefsKey = 'context-preferences-v1-' + JSON.stringify(meta.mailboxes.map(b => b.id));
   try {
     const saved = JSON.parse(localStorage.getItem(prefsKey));
     if (saved) Object.assign(prefs, saved);
   } catch { /* Defaults work when storage is unavailable. */ }
-  document.body.dataset.theme = prefs.theme;
+  if (!themes.has(prefs.theme)) prefs.theme = 'blue';
+  applyTheme(prefs.theme);
 }
 function persist() {
   try { localStorage.setItem(prefsKey, JSON.stringify(prefs)); } catch { /* Available for this session. */ }
@@ -1705,6 +1815,8 @@ element('preferences').onclick = () => {
 };
 element('edit-box').onchange = showBoxSettings;
 element('edit-label').onchange = showLabelSettings;
+element('theme').onchange = event => applyTheme(event.target.value);
+element('settings').addEventListener('close', () => applyTheme(prefs.theme));
 element('cancel-settings').onclick = () => element('settings').close();
 element('add-box').onclick = () => {
   const input = element('new-box-name');
@@ -1742,7 +1854,8 @@ element('settings-form').onsubmit = event => {
     const key=element('edit-label').value || 'label-' + Date.now().toString(36);
     prefs.labels[key]={name,color:element('label-color').value};
   }
-  prefs.theme=element('theme').value; document.body.dataset.theme=prefs.theme;
+  prefs.theme=element('theme').value;
+  applyTheme(prefs.theme);
   persist(); renderFolders(); element('settings').close(); refresh();
 };
 element('message-label').onchange = event => {
