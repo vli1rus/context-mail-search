@@ -136,6 +136,39 @@ def events(keys):
     return set().union(*(INTENTS.get(key, set()) for key in keys))
 
 
+# Short topical requests need stricter evidence than the event dictionary
+# used for questions. Keep ambiguous words such as "отправление" out of the
+# primary evidence and require two distinct signals in the same passage.
+TOPICAL_PROFILES = (
+    ('курьер курьерский курьерская',
+     'курьер курьерский курьерская курьером курьеров курьеру',
+     'посылка отправление заказ пакет',
+     'доставил доставят доставим привезли привезут вручение вручит передадим доставлен отгрузить',
+     'Курьерская доставка'),
+    ('аптека медицина лекарство медикамент лекарства медикаменты',
+     'аптека аптечный рецепт рецептурный лекарство медикамент фармацевт фармацевтический больница поликлиника госпитализация',
+     'дозировка препарат таблетка вакцина капсула врач пациент медицинский',
+     'приём лечение назначение дозировка прививка вакцинация обследование диагноз приёмный',
+     'Лекарства и медицина'),
+    ('самолёт авиация авиарейс аэропорт',
+     'самолёт самолётом авиарейс авиакомпания авиабилет аэропорт',
+     'посадка борт рейс вылет',
+     'регистрация аэропорт терминал экипаж взлёт улетит прилёт',
+     'Авиация'),
+)
+
+
+def compile_profiles():
+    result = {}
+    for triggers, primary, context, actions, label in TOPICAL_PROFILES:
+        profile = (set(terms(primary)), set(terms(context)), set(terms(actions)), label)
+        result.update((key, profile) for key in terms(triggers))
+    return result
+
+
+SHORT_TOPICS = compile_profiles()
+
+
 def split_passages(text, size=64, overlap=16):
     if not text:
         return ['']
@@ -327,6 +360,10 @@ class SearchEngine:
         if period and not (query_terms - {'письм', 'письма', 'письмам', 'уведомлен'}):
             return [Hit(i, 1.0, self.letters[i].body[:330], ('Совпала дата',))
                     for i in self.inbox if scope is None or i in scope][:limit]
+        if mode != 'lexical' and len(query_terms) == 1 and not query_anchors:
+            topic = SHORT_TOPICS.get(next(iter(query_terms)))
+            if topic:
+                return self._rank_topic(query_terms, topic, limit, scope)
         lexical = defaultdict(float)
         for term in sorted(query_terms):
             idf = self.idf.get(term, 0)
@@ -407,3 +444,37 @@ class SearchEngine:
             evidence = clipped_evidence(passage or self.letters[i].subject, query_terms, query_anchors)
             hits.append(Hit(i, scores[i], evidence, tuple(sorted(signals[i]))))
         return hits
+
+    def _rank_topic(self, query_terms, topic, limit, scope):
+        primary, context, actions, label = topic
+        # Every accepted passage needs at least one of these indexed terms.
+        candidates = {i for key in primary | context for i, _ in self.search_terms.get(key, ())}
+        if scope is not None:
+            candidates &= scope
+        ranked = []
+        for i in candidates:
+            fields = self.analysis[i][0]
+            subject = self.letters[i].subject
+            all_keys = set(fields[0]) | set(fields[2])
+            if not (all_keys & primary or (all_keys & context and all_keys & actions)):
+                continue
+            best = (0, '', set())
+            for passage in [subject, *self.passages[i]]:
+                keys = set(terms(passage))
+                exact = keys & query_terms
+                direct = keys & primary
+                paired = any(a != b for a in keys & context for b in keys & actions)
+                if not direct and not paired:
+                    continue
+                score = (9 * bool(exact) + 4 * bool(direct) + 2 * paired
+                         + min(3, len(keys & (primary | context | actions))))
+                if score > best[0]:
+                    best = (score, passage, keys)
+            if best[0]:
+                ranked.append((best[0], i, best[1], best[2]))
+        return [
+            Hit(i, score, clipped_evidence(passage, keys & (primary | context | actions), set()),
+                (label, 'По словам') if keys & query_terms else (label,))
+            for score, i, passage, keys in heapq.nlargest(
+                limit, ranked, key=lambda item: (item[0], self.dates[item[1]], -item[1]))
+        ]
