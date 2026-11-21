@@ -1,486 +1,1615 @@
-# Context mail search demo. Requires Python 3.11 or later.
-import base64
+"""Почта · Контекст. Python 3.11+. Run directly to open the inbox."""
+
+
+# data.py
+
+
+import csv
 import hashlib
-import io
-import runpy
-import sys
+import json
+import re
+import shutil
 import tempfile
-import zipfile
+from dataclasses import asdict, dataclass
+from datetime import date, datetime
+from html.parser import HTMLParser
+from pathlib import Path
+from zipfile import ZipFile
+
+
+ROOT = Path(__file__).resolve().parent
+DEMO_CORPUS = ROOT / 'fixtures' / 'letters.jsonl'
+DEMO_QUERIES = ROOT / 'fixtures' / 'queries.jsonl'
+DEMO_QRELS = ROOT / 'fixtures' / 'qrels.jsonl'
+
+
+class PlainText(HTMLParser):
+    blocks = {'p', 'br', 'div', 'li', 'tr', 'td', 'blockquote', 'hr', 'h1', 'h2', 'h3', 'section'}
+    hidden_tags = {'script', 'style', 'head', 'svg'}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.hidden = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.hidden_tags:
+            self.hidden.append(tag)
+        elif not self.hidden and tag in self.blocks:
+            self.parts.append('\n')
+
+    def handle_endtag(self, tag):
+        if self.hidden and tag == self.hidden[-1]:
+            self.hidden.pop()
+        elif not self.hidden and tag in self.blocks:
+            self.parts.append('\n')
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.parts.append(data)
+
+
+def clean_body(value, html=False):
+    if html or re.search(r'<(?:html|body|p|div|br|table)\b', value, re.I):
+        parser = PlainText()
+        parser.feed(value)
+        parser.close()
+        value = ''.join(parser.parts)
+    value = value.replace('\r\n', '\n').replace('\r', '\n').replace('\u00a0', ' ')
+    value = re.sub(r'[^\S\n]+', ' ', value)
+    return re.sub(r'\n{3,}', '\n\n', value).strip()
+
+
+def field(row, *names):
+    for name in names:
+        value = row.get(name)
+        if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value).strip():
+            return str(value).strip()
+        if isinstance(value, dict):
+            address = str(value.get('email') or value.get('address') or '').strip()
+            name = str(value.get('name') or '').strip()
+            if address or name:
+                return f'{name} <{address}>' if address and name else name or address
+    return ''
+
+
+def iso_day(value):
+    for parser in (datetime.fromisoformat, lambda s: datetime.strptime(s, '%d.%m.%Y')):
+        try:
+            return parser(value).date().isoformat()
+        except ValueError:
+            pass
+    return ''
+
+
+@dataclass(frozen=True, slots=True)
+class Letter:
+    doc_id: str
+    mailbox_id: str
+    subject: str
+    sender: str
+    date: str
+    body: str
+
+    @property
+    def day(self):
+        return iso_day(self.date)
+
+    def serializable(self):
+        return asdict(self)
+
+
+def records(path, wrappers=()):
+    """Read object records with a location on errors. IDs from CSV stay strings."""
+    with path.open(encoding='utf-8-sig', newline='') as handle:
+        if path.suffix.lower() in {'.csv', '.tsv'}:
+            rows = csv.DictReader(handle, delimiter='\t' if path.suffix.lower() == '.tsv' else ',')
+            for line, row in enumerate(rows, 2):
+                if None in row:
+                    raise ValueError(f'{path}:{line}: more columns than in the header')
+                yield line, row
+            return
+        if path.suffix.lower() in {'.jsonl', '.ndjson'}:
+            for line, value in enumerate(handle, 1):
+                if value.strip():
+                    try:
+                        yield line, json.loads(value)
+                    except json.JSONDecodeError as err:
+                        raise ValueError(f'{path}:{line}: {err.msg}') from err
+            return
+        value = json.load(handle)
+        if isinstance(value, dict):
+            value = next((value[key] for key in wrappers if key in value), value)
+        if not isinstance(value, list):
+            raise ValueError(f'{path}: expected an array of records')
+        yield from enumerate(value, 1)
+
+
+def load_letters(path):
+    formats = {'.jsonl', '.ndjson', '.json', '.csv', '.tsv'}
+    paths = sorted(p for p in path.rglob('*') if p.is_file() and p.suffix.lower() in formats) if path.is_dir() else [path]
+    letters = []
+    locations = {}
+    for file in paths:
+        if file.suffix.lower() not in formats:
+            raise ValueError(f'{file}: expected JSONL, JSON, CSV or TSV')
+        for row_num, row in records(file, ('messages', 'letters', 'documents', 'emails')):
+            at = f'{file}:{row_num}'
+            if not isinstance(row, dict):
+                raise ValueError(f'{at}: expected an object')
+            doc_id = field(row, 'doc_id', 'message_id', 'email_id', 'id')
+            subject_keys = ('subject', 'title', 'topic')
+            body_keys = ('doc', 'body', 'body_text', 'body_plain', 'text', 'plain_text', 'content')
+            html_keys = ('body_html', 'html')
+            if not doc_id or not any(key in row for key in (*subject_keys, *body_keys, *html_keys)):
+                raise ValueError(f'{at}: expected doc_id and a subject or body column')
+            if doc_id in locations:
+                raise ValueError(f'{at}: duplicate doc_id {doc_id!r} (first at {locations[doc_id]})')
+            locations[doc_id] = at
+            body = field(row, *body_keys)
+            html = field(row, *html_keys)
+            body = clean_body(body or html, html=bool(html and not body))
+            subject = field(row, *subject_keys)
+            sender = field(row, 'sender', 'from', 'from_address', 'from_email', 'sender_email')
+            if 'doc' in row:
+                header, _, _ = body.partition('\n\n')
+                subject_match = re.search(r'^(?:тема|subject)\s*:\s*(.+)$', header[:1000], re.M | re.I)
+                sender_match = re.search(r'^(?:от|отправитель|from)\s*:\s*(.+)$', header[:1000], re.M | re.I)
+                subject = subject or (subject_match[1].strip() if subject_match else '')
+                sender = sender or (sender_match[1].strip() if sender_match else '')
+            letters.append(Letter(
+                doc_id=doc_id,
+                mailbox_id=field(row, 'synthetic_user', 'mailbox_id', 'mailbox', 'account_id', 'user_id', 'box_id') or 'Входящие',
+                subject=subject,
+                sender=sender,
+                date=field(row, 'doc_dt', 'date', 'sent_at', 'received_at', 'timestamp', 'datetime'),
+                body=body,
+            ))
+    if not letters:
+        raise ValueError(f'{path}: no letters found')
+    return letters
+
+
+def check_day(value):
+    if value and date.fromisoformat(value).isoformat() != value:
+        raise ValueError('Date must have the format YYYY-MM-DD')
+    return value
+
+
+DATASET_FILES = ('documents.jsonl', 'queries_dev.jsonl', 'qrels_dev.jsonl', 'manifest.json', 'README.md')
+
+
+def locate_dataset():
+    for candidate in (ROOT / 'data', ROOT / 'mipt_mail_search_participants.zip', ROOT / 'data' / 'mipt_mail_search_participants.zip'):
+        if candidate.is_file() or (candidate / 'documents.jsonl').is_file():
+            return candidate
+    return None
+
+
+def load_dataset(path, cache):
+    if path.is_dir():
+        folder = path
+    else:
+        with path.open('rb') as handle:
+            digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+        folder = cache / 'corpora' / digest
+        folder.mkdir(parents=True, exist_ok=True)
+        with ZipFile(path) as archive:
+            entries = {}
+            for member in archive.infolist():
+                name = Path(member.filename).name
+                if name in DATASET_FILES and not member.is_dir():
+                    if name in entries:
+                        raise ValueError(f'{path}: duplicate archive file {name}')
+                    if member.file_size > 100 * 1024**2:
+                        raise ValueError(f'{path}: unexpectedly large file {name}')
+                    entries[name] = member
+            for name, member in entries.items():
+                dest = folder / name
+                if dest.is_file() and dest.stat().st_size == member.file_size:
+                    continue
+                temp = None
+                try:
+                    with archive.open(member) as source, tempfile.NamedTemporaryFile(dir=folder, delete=False) as output:
+                        temp = Path(output.name)
+                        shutil.copyfileobj(source, output)
+                    temp.replace(dest)
+                finally:
+                    if temp is not None:
+                        temp.unlink(missing_ok=True)
+    if not (folder / 'documents.jsonl').is_file():
+        raise ValueError(f'{path}: documents.jsonl is missing')
+    manifest_path = folder / 'manifest.json'
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8-sig'))
+        for name, expected in manifest.get('sha256', {}).items():
+            if name not in DATASET_FILES or not (folder / name).is_file():
+                raise ValueError(f'{path}: manifest entry {name!r} is missing or invalid')
+            with (folder / name).open('rb') as handle:
+                actual = hashlib.file_digest(handle, 'sha256').hexdigest()
+            if actual != expected:
+                raise ValueError(f'{path}: SHA-256 mismatch for {name}')
+    return folder
+
+
+# temporal.py
+
+
+import re
+from datetime import date, timedelta
+
+MONTHS = 'января февраля марта апреля мая июня июля августа сентября октября ноября декабря'.split()
+DAY = r'(?:\d{4}-\d{2}-\d{2}|\d{1,2}\.\d{1,2}\.\d{4}|\d{1,2}\s+(?:' + '|'.join(MONTHS) + r')\s+\d{4}(?:\s+года)?)'
+# Only bind a date to delivery when the wording describes the message itself.
+RECEIVED = re.compile(
+    r'\b(?:получен(?:ы|ные|ное|ный|ных|а|о)?|пришедш\w*|прислан\w*|пришл[оиа]|'
+    r'прислали|получил[аи]?|приходили)\s+(?:мне\s+)?(?:за\s+)?(?:период\s+)?(?:с\s+|в\s+)?'
+    r'(?P<start>' + DAY + r'|позавчера|вчера|сегодня)(?:\s*(?:по|до|[–—])\s*(?P<end>' + DAY + r'))?\b',
+    re.I)
+
+
+def received_period(query, as_of):
+    match = RECEIVED.search(query)
+    if not match:
+        return None
+
+    def parse(value):
+        value = value.lower()
+        if value in ('сегодня', 'вчера', 'позавчера'):
+            return relative_range(value, as_of)[0]
+        if '.' in value:
+            day, month, year = map(int, value.split('.'))
+        elif '-' in value:
+            return date.fromisoformat(value).isoformat()
+        else:
+            day, month_name, year, *_ = value.split()
+            day, month, year = int(day), MONTHS.index(month_name) + 1, int(year)
+        return date(year, month, day).isoformat()
+
+    try:
+        start = parse(match['start'])
+        end = parse(match['end']) if match['end'] else start
+    except ValueError:
+        return None
+    if not start or end < start:
+        return None
+    return start, end, (query[:match.start()] + ' ' + query[match.end():]).strip(' ,.')
+
+
+def relative_range(query, as_of):
+    """Infer likely received dates. The caller uses them as soft evidence."""
+    if not as_of:
+        return '', ''
+    current = date.fromisoformat(as_of)
+    query = query.lower().replace('ё', 'е')
+    def span(first, last):
+        return first.isoformat(), last.isoformat()
+
+    if re.search(r'\b(?:позавчера|позавчерашн\w*)\b', query):
+        target = current - timedelta(days=2)
+        return span(target, target)
+    if re.search(r'\b(?:вчера|вчерашн\w*)\b', query):
+        target = current - timedelta(days=1)
+        return span(target, target)
+    if re.search(r'\b(?:сегодня|сегодняшн\w*)\b', query):
+        return span(current, current)
+    recent = re.search(r'\b(?:за\s+)?последн\w*\s+(\d{1,3})\s+(день|дня|дней|недел\w*)\b', query)
+    if recent and int(recent[1]):
+        days = int(recent[1]) * (7 if recent[2].startswith('недел') else 1)
+        return span(current - timedelta(days=days - 1), current)
+    if re.search(r'\bна\s+(?:прошлой|этой)\s+неделе\b', query):
+        monday = current - timedelta(days=current.weekday())
+        return span(monday - timedelta(days=7), monday - timedelta(days=1)) if 'прошлой' in query else span(monday, current)
+    if re.search(r'\bв\s+(?:прошлом|этом)\s+месяце\b', query):
+        first = current.replace(day=1)
+        if 'прошлом' in query:
+            last = first - timedelta(days=1)
+            return span(last.replace(day=1), last)
+        return span(first, current)
+    return '', ''
+
+
+# semantic.py
+
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import tempfile
+import urllib.request
 from pathlib import Path
 
-DATA = (
-    b"UEsDBBQAAAAIAA+KdV2YAGuKAAwAAMAoAAAWAAAAZml4dHVyZXMvbGV0dGVycy5qc29ubK1aTW8b1xXd91e8ci0SHEqiKC69yCZB"
-    b"UaDbAIUj0bVaRTJkqW0QFCA5tmVDsmS5Tl3YThwh2RUFRhRHHH4NAf+C+/6Cf0lx7n0z82Y4lDyVF7HCj5l579x7zzn3Pn5f2tzd"
-    b"+OPWZqlZuldeqTqlpdK3d7e2v9n9u7xJ7ykknwbUpxEFpaXSw4Nv/tza2MdH/6YBTcinKf8XkK+op9vkmzcDvDyiMfm6Sx4ube1s"
-    b"tvZw5Tn51CNftxW9oB4F/PHm3f1WqVmqVWv1suOUa9XSUumb3c3vcMFr6us2edTTHd2lnnZpqLvk//brna936CfdpZl8jKeZtfBK"
-    b"hrpDnvrD7z62z1aqjqKeojfk0YA8mupjRTMsQragO/w3VLqjnNVmrapoSp5yGs2VakUBB9yLcfD4I31IU32mu7qjT3Fnp9Gsri4p"
-    b"rEu3aUIBvkRjdafCq/xBd2gMUKYUMjBDRZdYtX5EAY0U9cijCT72sa6Q+vox/qVAd5eU7lBPn9IVXmGt+hhvYbE01i5d0QWFuCNf"
-    b"SH1ewhVCVin94zff20GuVRurRaJ8ptsUAlP+i0UKvl98xbeK1tqVgNIVHo49pgJ+RoFJhCnvHGDrNkKvO/Ohd9as0L8jT7f1U93W"
-    b"ru42Fb3jQIywEvWx/SoV0KU46nHMK/hCSH1FF9FGoqVLXN5xoAKaIFj6mMOTZDJCizSIMiXKAe021UpVSZixsoqicwr1Y85DoNVF"
-    b"Dj7nhBzprnm27J4uIjgU9SlUNMKH+ok8x4rEXPD2WvcOdjaLhO8lhVKm+llSpjM89CIvsPpEffHVx/ZZrbpevU0E160InjOUfSld"
-    b"7LGHMHlmWW3yVUOtrFbVx+40wfkQN5Zy1kcmBoHumJoA5CfADbnR1W5F3WajQlRAfmzILFTxyxDr1sf6RNLlNRd+vDZ5DNKPkUDc"
-    b"FYX454Kfw2QRKArpQh+BMXBrzlaTckkSzPSp7lIg2FxQyI95jA+xpmFOLmy0th7sF0mGN+TpDnjDEJA+RHbyghbAxIX+GfKhYeXD"
-    b"TzSjMXlQhUXBOQUcbQr1U3yTa2vG+OLjMMmXiqJf+f1RVL1SYH0KUaOiRAZhjqOLBKMpK8GYAokIaBc3QFlCCbrkz6F9f3e/tV0E"
-    b"61e8VqzHx+PH2NMA+JMfpY4+TUEKHfOxC/XhP3RmlOnywzhHGx27vJSz0qxyEnNxcFT52oGgCNk0qxCODpgUx/pEH5pkZRD4M9E2"
-    b"xcUa0pBGuBCUJ4KGEgSZIXoh/qLycHeAIInsOM1qdQ6/1t297a3WXhEEf46pHM5EfRjwOvUpckYfc9CDjIoWdhmO7TLeS91LHiMp"
-    b"UeqJKky0y8WpO1Yygkhi0bEMDxNBL3ISAQ3mjAF56k5FLXAvyM9Y6bQrStdT1UbTmcd2s7W99dfW3ndFwH3NQY1sghdXCK9jBMqK"
-    b"RQp1eYvaTxm5My5Kj66iyoifApYPs1jgzZF2EW9+REiTioLxLAtngUktswOehYYgxxF6GsCgGX2VXMBLpmtJ4zksN3a/fdDa39rf"
-    b"2t0pAuf7XBMUiYM+FVAz5d6mS17axLi67g1C+jq+U1SlLhKUw2Ysr/D7BEgaYyv6I5BMWWJsPg1ppLh0JCW5vBFv1j9+WJA4XCNR"
-    b"SPon2p2H7u7ORjGOfMEM6fKD06KTdWvV2m3Ux6ZL42fh/r3cx4sJYz+un7IHdCVlRJE67DaiUKRNgDB2TJL2XY2j6NtcC+FZXa47"
-    b"jTkod/fvt/bK97a3/nR/XuB/Nv7AdFWfoyF7xaIktsC0H3bIrqvol4AJAfCQdjTmimNQYxrE7QZ0Rf5CurOatS/vlNeXoWaKfmCD"
-    b"J7SJDL0AE9BlftvGkavV8vjx3sH+wV6rmHiHsQHk2rRbg2Ae5jniYg+TakFNd12wCa7ZvilfKRaDsdysoXX9L0qaLaj0nvbFWLiY"
-    b"pFOxojNj1o+or139TKLjMpnCVE2S7WVg/tvu3l/KDuvpJ6br+3jhoe5wO0uDSHjRhRtuRPXg0cMUetwWCm8peistIN+td+Mw4ZxB"
-    b"QJ8Qs01eO19vchpyrTIrGhaAcmcM61Qf6cfQ+irwPtcdLrOYpk1/9yjar37CtiEWXJhhdPQG/Ktcw2/wdT4d3/ME0Dw4eZPwarfA"
-    b"NSVP6LPHnB+XFCyBbIQG0cx5TKQRtOwQeabCgQAKAItNTm6aZvw8KxSvaszV6OVjVStAnXzTS3AkZFI4p4e2L4XOGwtCCS4N8cYN"
-    b"yLyEj0kaGuhxrFeHkYQ951yYsThj66i/E25mfSmOC1Pg/ZRS4iOj2imp5jrClyPuCmhkzDpu1DYjCnvQ0ZM2SHDvS9zzkV3+dGRf"
-    b"YPxhWkzLvmfkJxte7Bb9RZhnilLV/CvHYMwZjvoc6bY+YvEGeGiyg/n8gVbFrgjCdyVd4QjAQb6PIftNdXdjv1xfdlZXKw827xn1"
-    b"ShD1uE/lgYS5SsZ3xntdaJeNbWcRV658OooQ6KGZoEjUY5IJzL55BHbIxteLnnsblFM9O2Y48IpmuzwDgXHE1RNktzhHn5cBIamt"
-    b"2uGOB6TJKHXM8mOo8TDd9wf6DD155Jz5wUATVr+b8KZFE/kAr346wD/yveTO6CNgiqHcGcvO75Zj+e8jcXT7hg795YJytMgOxlrR"
-    b"pVmAHxsxhn2mXRlxVBT9YrfmPCyyHacHacH6YcWgI0a04KY9jLHSjjAeR/o0xF4yKD68v/ugvJx/JoBEms0bpwUexR6/8KJ6Sp/y"
-    b"9IknDCmQ32sXgzPun2FDJNlugBjtLFJvoH7/Zblec1bX7RnjM31mZj6zOHkmYi2NQr9lbkUohkuqLgY/zZNyJZccGgJMOmorqRxP"
-    b"Rs32diH/qc2yzK2sOfVaIxfvWhG80x4qa/czPX0K5reid6Z5HOVqmM0Ab5I2PCJOTmeOE2u8aWlwWKGcdR5JMUqJ2lvGCGFy1p21"
-    b"uJpj7wV07Z7fy0VpuQhKL9DucyFhhX278cCTEeNHmVJ/p10a6KPMYLHApCNXxK25Efmqtr4uQ+9FvjIy8mvZPPslKTIwhxxlxTrE"
-    b"pDpMkUBPPK6whJCHh+Eyqgb/64os5kK9UgTqlxzPOX6ep4HsiWB0jIWZMLdl6MAwazMj+DwKcOoW4K94xqo7MjrgrovvgP3y9FWi"
-    b"D6JLStoWUv/mqXDG3PdtVbbaRLQvIqwg+eSMKA/d1WL0+sS0X4a6UIJIg6k+QUcxSy7V7jXO1c7jG90rqDDVDHMrIbaBK/VERikj"
-    b"dh2uikSH+Zj8mJH5kAbDAr4QxWV8quQpMwkc9YTHB5ht6afsaY/l/CQ66hSHwymVi2i9CKKs+yKD0fwcy0rVxWfI1LQfiB+UPnbi"
-    b"Ce9a06lVVHxczG0BH2IdRcfHbNqPlqJjJww1GSeuMJyTgteFb3w2hR02aHhtlCFK/6g4jnNxXCsq/L04hhIweI7kMO7jo38pzoO0"
-    b"2kv89TNuCa5tomQed+2t04PO0Dh2a13c2T1mDCBY8RkCTKaZ76WsJvIx5WcMa8wd7MbH7/ow5/xIAG0UIlKTJDj24CNPOW/hdDMJ"
-    b"awXwc5Bp+owu94kQlr6q1lbqDSdFf9LqmAkxCtY+GP+RDYYcoEiDhHYWYcQIhn/JodjGhrmwrReBTXiOD/lAbTxqkZM3e9jl2gyV"
-    b"EX7y6JLfD2h6w28T5MwZpsuLE9+cSfP5LTtFq0phQ83wOH2+7Shnuaq4di/4Tckla5XaFcvUqFXzQDrYwTo3iyElogWGsFAyDjLM"
-    b"Ib5EMkzvCw/N/YpuS4PCHadBzMIp7rpARBnS00cLDnHN4TQKMj0yb6wvO/Xqjd37/DHZwYPtrY27+62HRUbB/zRC3o99lXRazKs8"
-    b"0hPB0M+lV8PXr5MMPnri5EdTJ0dr1/nIF/b3QQUzTk5MaE2jbxIPjNXJL7/8HxxxY8n5JuXJqhrRd8rCiTfiZEfbPn+Smd9+14vM"
-    b"ghedn9lnXJmBxrvr0u/aEzTLk+acoyGe2dQWes+Ii1jOyDhEP99BGpsfakWXXPKMF6dJebbFwLVWAK68u6pEebEf8+7/gRgMfyIE"
-    b"U25MhjQt586x5QdS2ek5q2sUzssKjjiMQZRUZau+YHaRmuJFkyxD4fgJA/+ZylDtf1BLAwQUAAAACAAPinVdHfMWJtoAAAAIBQAA"
-    b"FAAAAGZpeHR1cmVzL3FyZWxzLmpzb25sndRLDoIwFAXQucvoWBJa/mzGkPKMRAJYQWOIezcUB77WcKNDGk4/tzedxWUi8zg0tShF"
-    b"KMVe1L1ev45BbAcMtXSrOk2ilM/dzIDiwNBx6mpgIm5UmCdAxO4qmpphBCjh6NSP1AKS/nr8jAO9/IYWyT/NvTfnQMoQmOKLUdvG"
-    b"zumaCBj5xcR/mAwYVpvrqR+CCERtt+4QlEDsExRA4hN0/tQnoM82HoekgOQ+QSEXPsm3iWKdWckyyxZh12/J1NXVSOAVUM7LQZVp"
-    b"GzIAsRK8uwaSU6wFb+OX7QVQSwMEFAAAAAgAD4p1XRWybli1AwAAKw4AABYAAABmaXh0dXJlcy9xdWVyaWVzLmpzb25snZdBbttW"
-    b"EIb3OcUD1xYg0pYseZNdNgmCAjmAUTQGmk2BJM4iCAKIlFOnkGChLdBd0R6BpsmQEsWnK/xzhZwk+OeRstxEhV82tkWTmu/N/PPP"
-    b"8F3w8s3Zq7enL54HJ0E/DA6C129/Of/57PzFT6dvXp+9Ck4C/AOLAiVyrFAFB+4J/uNP5CgMNqgkRooa1YGRS0lgjV5Yw6KW3yUx"
-    b"MkWNQhJUkvABixKfUDzsvu30+Y/nZ8FJEPWjYS8Me1EYvH/w7g5b5Mf2BwqZoNHAlSEoGpnjhh9KpAbXqByTB8OhH8PfSLFE3obE"
-    b"CilK8+hJL+qPBh5Rj/yirmBxg1zPKDPUhoEllhgWmcywNHKJAitHMu57kAx8SVKs3NmvZYJUEpmTppYruTSw1EIDi7XWKvUAGfqB"
-    b"ZDyxEnxEgwIFBZmhQK7Ra4oDFbVsqU7eyitWYt7KD0sK2jx72jvSJrkv57EfJ8tGCEmYE2VS9TJ7lvp1NdNeuC/C6JsI/7ImGmib"
-    b"dl6+PXshsYt9J3dyJVe8FEvC++RSpiyhtpPVPBZde+eKr2JLJfYAHnsBywQVGlk4WP2hqZOFgugpCqP3JHqOTOZydX+csO+Ps9Ic"
-    b"brrqUUgL1lDmErPkWNKQLFYybWETVR67k8mrVaQNGpnJB+pvG0s+eJCHfpWvJJY5PdvoMazRc9DB2kLGqsK2oXc5K1kYuYCVCdYy"
-    b"8yDc7+lMzWZPe6ifoLp1FK0zrY6PsdalkYWa3HL3K+4BdOgHlLlJR8etZc7fLneVmksp03ba7dD98Lg3DMfhsQfUkR/Ujv9n7EQW"
-    b"1ZFYbFBr0qbtEGQV83aAr2TqATXwg2o6Y1jTRPhnqmqqZX5gusLquHIWvCPGHDWbucCNy7aaIe3Yg3boR0tQ7QGJuyZmDROkyLjC"
-    b"UHTsoFJmyFoD3Nx+mVcij73QOJGYCNors9KlbO88w7UhNZcyFWaJVH5F5dUVI7/s2Xba/7bF+Hzx1zAKB2OPmOPvsobtwmORU/40"
-    b"/Eou6MnduU0/OhqOPIZ41Pc1hTub552m25lI2yEvs5310EfVUegnHbf1qVp1QHE95+gZjQ/D4d41MBx9FddzFXdLBb2oQcp1QM2S"
-    b"i58uV6nE21eIVrUchO59gTvX/6xc4fFXcIc+U6+VjdqgJG3p8q7n2SsLZG6qNEzb1G0zfJFRTi4b7nMhk3YSLD0q+G1r3wNbtjnU"
-    b"GcxIa81YTgE5C1LL+khD4IrB4cz3HpVbO9L/s3bIzEmhds6wl3wQvH/wBVBLAwQUAAAACAAPinVd9+F1dDUAAAAzAAAAFgAAAG1h"
-    b"aWxzZWFyY2gvX19pbml0X18ucHlTUlLyyU9OzFEoTk0sSs5QyC9LLVIoyUhVyEhMzk4sycjPU8hNzMxRSM4vKigt1lNSUuICAFBL"
-    b"AwQUAAAACAAPinVdKL+3nMkLAAAkJAAAEgAAAG1haWxzZWFyY2gvZGF0YS5web0aa2/ktvH7/grm0EBaR6fYlyYojGySQ+wgV9zl"
-    b"rmcnwNW+CFxptMuzRCoktfaebaAI0A8FChToLwmKBgjQIv0L9j8qhg+9VnuvAvWHlUQO58kZzgzNykpITVK1mjD7uqRqWbC5/3yh"
-    b"BPfvEvybWtaaFf5LQ1nlrIBJLkVJMqppWlClQBEHQFXGUh21Uw0kaFaCB8PvqBm1MEtdFnFFpQLpwb4+fvTwiRmxIBXVyLGffkL1"
-    b"0k68ZIYtP/FHVn2FXE4mTx8/PiYzAxkmCcIkyTSWoESxgnCK9IBr95gcHD56nHz5+OmTb4/IjJi1H5IgZxe6lqAC/ChAa5AqRm0V"
-    b"gV3xh28Pnz443Lrkhxokg8GSp4cPty+QUDTgk4nRI3lSUMaP4UKHrVam+xNCCJkXIj1TZEYugyqISDCX+JuxFT4Khr/aDOnMTCP4"
-    b"D7XQgF9LM7PcM7/3zO9H+Ksg1Uzw4NqQWLIsA55ourB0VCpZpQ2cXhcWEVCDXq0WwfXErMogJ0nCONNJEioocscw/qm6AhlO42Y+"
-    b"FXwFUifpkkoJuZodyxqmLTwUOdpJIwMnz/vjlj070VBeUp4VkChNpdZ0YRiIiKaLiFCtpeoww3IcJ4x30RlpW5gBsZhWFfAs1HTR"
-    b"MgkFywkXuscV5VkPuzXXCGIjnccbnPJguiEM8KwnSl+GMaqzWXf45O7e8+0iVaIK/4/CYJBwouBrX5YB4ddRMAgmkwmiTwugPJmL"
-    b"bB2uaFFDZGLL7CtaKHBEWG7GiJBEQqyAynQZyuDT8PN9HL/CxVfVVcZWV3N5pem8gOnpPIiIQyghftDh14WtWcdLp4PJOAfILD8b"
-    b"U2khFHRWGCgyI0EQvxCMhw7MCGyhPIR5xhKqgqYQBqfylKMPorq7oyNj9e4u3cVxEvRRoj7qeSiDk+9Pj0758w8skBPdwkrQteQt"
-    b"6Cm//Ci6tlQMBxY2Vloy3FLWLjmDIgulOI/IDqcleA/MhST4jZvKjLeKbZgS5/ECdIjTrZ5YTphiXGnKU/C2DpWWEWFcT6dmt+JG"
-    b"2oSaC1HYeaVl2Ge3v9ecrJtgr2YDz8EBJpplEhTGrwaZESqAkrIimOJu7Iw6cDseBJt08c/obQMhjr56Hcsbdpz2+7x2JM+DS5y/"
-    b"Jp9euiXXnwVdBEbLyAcUCuybkH62u1+CwO0EpkSSUeeenV3gj39OQp8cxHjAMyVyIUuqI1LQcp5Rovab9AHlq/AlVBEJ3s/i98v4"
-    b"/WfBtKN9LdejRrX0vF0RYTiNG2LdWHiRQqXJdwh4KKWQfXQVHRH0iyYJCnMpXgI3J1pEVCG0P93s2f7QJBUWZSbShGX7aFHzjVtj"
-    b"Li56Y6qev4BUdwaAZyDbb5Sk/cJgZr/M5xeVFBVIvW7iMZpicDw7QbyhTMBFrJ0orkAyWrCXGBy3LLfpoJ10ppeQCpmpEHO5iJxL"
-    b"jN9SzUJvrjt37jwFmhFhRPTg5JzpJaGkECnFtIQITgDtoGLy4EARkwV+efQdUZquUVTGFyq+c+eOwWkWI8FYVMBD4KnIGF/Mglrn"
-    b"d393V7FFEBEO5wXjMAuCKaHKnVG9I8lgUHWes4u4EOeYvuBWvQziVJlcK9ZqFVwPdpo4R49P1So+YKlG2UCGFntEMihYyTTIWXCq"
-    b"g21EZjOH23pYELmQ7f/QdZD3CKkhS8DrEiRuZyQfkXuDSOQE+kZwE3SlON+cN8xTpqCz68M8uEQGr/cvkd71PimFBJKKoi65InpJ"
-    b"OeLTSyCYDoIcMIp/azwFWnZH3PLNdG7zY9Q6z/B9qPhWKfYQ6anF639vXDE2lI4eB1tDyjYZkbe4EDRTw9O/++cCjAH+/dHjbw4g"
-    b"FZlVOu5GkIOI83ZWugQp41ItroOpdRWQ8lWK98duw7tT2NufeR4Tx5zIwp2cwfq5Mc8ZrNEsPgggUjdkNdXLORzV8eO8YGpIebtW"
-    b"CFxUkGrICOWESknXRDSBqbNjrRWtvpqd4wju+XiG2klcVWiCWnucldQUK2N7FV+bl170MIsRj8kThNSQhZU9HFExxh/kohDzMNgJ"
-    b"psZFYqZMaRvahKYa8RfHjYVHFEwlGcNJE1FOcMzWVE6UtsjyIdeIYtlDbmy9bRnqJGwM07wChiwYqzVsvN5QiKNrKHSJh5F5RCbO"
-    b"C0mOj77rGAt5kuI84XXZhEF/1iC2iIRBCUrRBShTF1s5TaUs0roErs2HycVUL3vAP6rJjDSMXTpK18EwqRpsT5PsjrjFNrmpHmxP"
-    b"ewwOwqjNEZChNqNGKRJmKnAnpvsyArl3lg0wuUwiOYM12jcM3IDpFjBtK3stKpYOFmJO0a7KRGo6CyJb+2ei4UI3HxXWRQaXGzUD"
-    b"DUwquAY+FBMrsZaGwYNDptmAz+mY8p1uMKkVmlC+Dl1IwT3RCTrhTlf2iOw0EkVkp6E8fSe7OR7QGalXMXKEJNxhucm8W8R463Fv"
-    b"QTurq4KlVIPHc2mf78lrEuZMKo1b+LJBfWKnn19PB5xsQJAZoXrD9v3N1ypv04IDyFa1Yzg7pbsZEdLgcBU8Fm2hwekLOwSajm7p"
-    b"AdmusQfwJnceOJMdxJ2G4d8/E1+S+W9buDXw7nvDtMY/tiZaNlOKSBKRhMyMSKbUZ2gGbJ2Y5slwlReopDpdurLdtzG+Dz/fv/3x"
-    b"5uebf9/8dOUAp6dqZ/9U7YTxB9PfBJGjerK/t7u7+9w0NB6RK9vX2KRlpdtG6ubX2x+v8OfmP7d/uvnp5h83vxjq/7r96xWq6X8i"
-    b"3Viz40dhT/iTvec+VTNNsJ5ibMI8pj9vdvdi0HbkHGLtqmAUqe8Mu4aUrenCDbrWq2b2EW1Mt+XerLcf11wvQbM0qZXdly1g5wtf"
-    b"aZqKmms3geDu1UHbtsDN32//fPPrzT9v/3b7l5tfbn4ONllxipy55wiA0cnMPjansVzsCYEyZybe45RzG51QMyQhBbaCzH1iPa80"
-    b"LU1D21f6wXSTCrrLDH/6Uy4ouEPB2aZTn25PDrlocqBc1NyfmK6idVO+07iE9Gyjk+ELCBOlkPd+D8O3Gzp9BvKea+W9gsPgAKN7"
-    b"WSu8uVmBKbLsevLs2bNndx89untw0GfWoJxMJgf3j+8fHR4nXz14aK4pwjblaVNTd02RZLDqDOJVRH+opJzloHSTvz49vH/w6DAu"
-    b"UVM+J8aTyPR3FWhfQeHhm1KeMVSJOYL97QcCBlFzGVKyCt2XFYkNM4mJhimrKDL8kuGe6C19s0X9/nLDSSd7xhjQcojYB2qatsCj"
-    b"/aRmcdcKWGV3iwWvFtsBSWm67GycXnLe0shFYaMVzptRjEHt/KDDEcj5eBfD+CVbgMKI6i4AY3MtZkebwjhQS3rv40+CabyECzc3"
-    b"3WTHcI+aSoWshDSmsNAD2Lg8Q5HsRZvtfkUELpjSiTgbXPUYYdwdni2pUBQ0KlsNZAGucdO2pUlLVZISyrntJrq1MeO5wFJxrKh3"
-    b"nVRzVWhXGsWYjnOMv2ONAt+27nuYz04cmk1zbsHipHmXSr+TADphbYVmW7cj558j3ZE0UewlkM/I3u4u2SF7u/d+u7Nz7514qblP"
-    b"hYs1KahcvAkzTvgThMGk03K2YVScjjqmdctipqFUYzrO7GZ3W/ZDss2UCDeopM2Q0hihY6WtfmazDZ2N6whrGsbrTVp4iU5mNiy8"
-    b"cVfJ9j/dNjY+brkwrqFELVOImuv5+BtaQnYMeBtO5dr4UcbkzOrAdB1Bg7sQQwSi1lWtt9vasWx8w8Iajxg3JP7ZfxuIU1GtkSEx"
-    b"fxF6Ju368aVIp7mjQu1vguWM06LYoiW8x0VWmTL+hyp+tVBxzQvGz8KSKcX4oh+LXPIQNlvnzc6DVzlpfz3y6Sg7p/CHa4ILurt2"
-    b"cOx6/nrwY8x4gG4zT4X9ZRJoZkrx0c54p7xq/a8pdRlvSNirJ3duROTyejrulD7guZ5QP3S6ur3VuY2/W47d16i7ER6DxNqGHyyI"
-    b"W7UjPcZXtNjojBiHG7Lx+sMV/2iqa4p177sfsE5PDtN7s0bhbyX/0df37977+BMU1hYuaMBeEPZXfEbMyX8BUEsDBBQAAAAIAA+K"
-    b"dV1wgDvwvRgAADhHAAAUAAAAbWFpbHNlYXJjaC9lbmdpbmUucHmlPNty3EZ27/MV7XViACQIk5LppLgay1pZW1bZK7ksObtbw8kU"
-    b"CPSQvcQAYwBDkRJVxYtk2SvZjDaX11Re8pIXiiIliiKpqv2C7l/Ql6TO6W6ggQEpbTKl4gB9Oef0uffpHrHBMElzskT94fctJl8G"
-    b"fr6kn1Oqn0YxC5KQhn7ut/ppMiBBEkU0yFkSZ0SNuZqM4pymLglp3x9FeciCXA6GaUHkZxktBhdNckR/FAd5kkRFf5SOeoEfLNGW"
-    b"HODlFDr8SA9IaeTnbIX2Uj9epK3WV9f++JubV779onf7Zu/b727dun7lBmmTLE+9gb9M89SPM/tX39+hab42Ysmw0/WzsL+49Kfl"
-    b"6NfW3dVgZSEeuN6vXGLxV+IHsc2P+AE/4c/Fj+In/lI8FH8WD8Rjvsd3+RuxwU/5a77PX4ifxY54JDb5MT8UW+IJfyZ+sZzW1zdv"
-    b"fnXl6+tfXTuPGMsP6HIyXF2zAOmu2OQH/Iifig3xUGxbTkvN6135+psvr/zm2m3ShmH8Gd/jz/k+P+Av+Et+yF/xI/6aH/MTfgqU"
-    b"iU2xJbbFA/FQ/CAeAfXiz+KxeCJ+Fr+IHav17c3fNdACorLvsqFdR+oSu0UIIZZvudaC5VorlmstWq4VWq5FLde6uwR/LNdilmut"
-    b"Wa61bLlWZLnWwHKt2HKtxHKtoeVaqeVKSJnlWrnlWiPLtfowASDk0BrAUyb/4LMCqVCtwYw132o5LpDPgrx9Ox1Rx3FarVZI+yRN"
-    b"Bn7cW6Zr9p0kDZ05xJfSfJTGBFq8lA4jP6A24iTWkuWUTWsMmtbWrALaKMuYH/eCJE2lpiNYl6wkgb8wivx0TaFgfRInOfHjNdvi"
-    b"uxa51CbBkp/CtyV2LNJPUtnAJB0OSVKcgUSxzI+GS76NrRGVWBzyGbl4QYI3VnEjiSm2DfzhkIakLUGgECM/p3aT5jmaSCAQ6QDc"
-    b"LCZjGmYSKjE4Z5PA+pqKDyQZ5dDAj0MW+jlFRaMDWwGrwyrHsb75Ehs8JjTKaAVryaNLZPZs+gp4GVBBc1uihzUyt1gmjUcDmgLr"
-    b"DJ2BT0T7uUtStriUKzZ35ljXlU+MTJKZue74gjPPD0Mb5pJJOblcNOvLlhLHO6Z2prtkUlKqW2bmuiVAWEpE85ymTdJ8HzRq9hip"
-    b"7zHDJEtONCaMhqFmaTnnfHIljIGfB0sosXvLdE0qpKkXhlBZn9gwZk7pWNHlOFUNum/6gZiu5jbLaWorVDBa6pRuIO02mTHUrtX6"
-    b"/c1vvyBtklIvSAZDFlE7tTr/PP/7XnfScqH5uxvXr9784prTunLj6pc3v62Olegt+/KlDzrzdz7vOvbluc78HW/y76e6k5/D01R3"
-    b"ct7r+FN3+e6U2Oneu+DeXzdeZ9yZC/c7U73u5fkQ+oqu+XCqO7FuKQSqE8aNTa7OmA/vzbr3HfvyB/N3HLmC627LaV37wzdfX796"
-    b"/Xbvxne/+8212jJgBXNvH/zHfDaxPr9gX57DkHPMD8TGOn/Jd/kR3+Uvnfls4sPL89mEY8+H9y669535BYXBad367re/vf6HBrD8"
-    b"UOxADF1XX3xXfp3y5/x0nR/wY7ENb/AlHsu+Qz3kgO/B1ysY92odQMGfX2AEDjuAKfBHPFwX29Bxyg/W+a7YWRc7MHiXHyNiaHsI"
-    b"bQ9hyN66hnyMFKxDgF/nu+sw7/E6ELu9DtAO1vmp83eW07p1++Y3ytdY/JDwPcL3+CnhJ3yX8Dfw9JLvErFJxCa8HPKXBL5P+TPC"
-    b"j4jYJnwf3vf5a7FD+KnYIjDxRII4IOKR2OKnRPyMX8juIyJzAXgDXu3DhNeA+1B+Ya5CxBaskfBn4jF/rb4AhHw4JPwA04YnQOWh"
-    b"2BRPQKzqhe8qSEXPKcF04wC+DvgJ0KoexC/weMpf4Zd4Kt8O5dcByBIJBfrFhngM44pXkAeyir8SWxLhKa7xBbIS0iNkJ3AFeJkv"
-    b"UeLHJOmTPJFOPbO8bBix3IaE4ENyNU2ybCqlfZrSOKAkSAaDJCaRHy+O/EX0Jhg3fYztfkQGPos8ciUmdIXGOfGjLNH+qPUh8QOA"
-    b"R1jcL/LeFeYjGeB+Mo/cXmIZYRnxJdyhnwKYpN+PWEzB/6SMrgCeJKRe69o/Xbtx+xY4OpVgsbQX0qGf5qOUWnPE4nsonQNYMPAI"
-    b"RLnL96CJn4BaE3w9BJGrB9SCY/6G78IIsQOKBpZ0yl+Lp2LLeJVgn6EctojYANMBxdyWXZDNFlCLXr4rfsbc942cV2R0wRINRxHt"
-    b"BUuQiyPxb8AvIKWnMLN8PcBEF5W62ghahpn0gfipXOIhfym1CzX6FFTQbCzGgQPaR3gvQGsky17zU/4CxkhtegkvYG/AoJd8X+Xz"
-    b"wAqxyfdxtc9LsmTDCfLkUK81pf1RHEr5IMg9VN0t1E1Jlkm+FgiYxyY/FBvggGB0tWNX/IDy4nuI+0RsS4jqRVqgiQ9RiMckpWyw"
-    b"MEozOgBdU8QpUof+GrQirbDm10CndEX4KJ7yF8UL7CeAC9rmJf1GA5KgwTxSIhRbqJQn0v/rRSgGikc4tdTXCvhTTWZII7ZC0zWk"
-    b"cx9FDO5qT4rxSGyLDfEEIKIQxSZaRSHiBquApkNgHn8p+fhGbPMTfoQsFY/BSYpHMN9AJnbkwGKmdnpgOttqvYf8oOAtC5ZHQ6Xp"
-    b"GsqxVIQ3fI+/LG0NUKLoatiBZc9AJVAWT1RD8QobS7A7WKrG6gcBzTLECrZ+xHdhZYBTLUVs8zfK6YsHYDEA9xmuB7VebEqDBAwa"
-    b"aJQssrhQaOV898RDfsr3pcf9UTID2CRdNdhfobLV5lMwKQAvNqETLPA5WBHw4wAELzY14iClIY1z5keKj+BpgN8Yh/RLFci2eASe"
-    b"zGRKSjOKSi42kX3ob4DsTSUWSFMqCjLeiZt3UgJQDUokj8WWDFZnQNWUDCjNWbyonDcwWVoBChuYC3OOMPrrBvkChv5TYXToG07E"
-    b"A+0dNaNl8ya4A/EEaNAd4KS2cPSeeCJ+kTCfKU+7L0VSVd+UBpQNJddAy44AOrIBRSThik3JbHyQAeOQnygt2SQsXklYAIENYWFC"
-    b"AtxRKv+KgAaKTYzhr8UTcFfAQzCpfbGlnNsLrGRUaMtGC1mQsiHEWG1gfF95DrR7sBtg5oHKO7YwwQEFFA8KfVRlmv26Z6g3mcDF"
-    b"duGjZGyQvhpKLYgLdFo8kivR5OYsWJb6B9ZcRlb1KB5DmgVoISJvmMIoOrSmYQItSQKL3ZerfQNOjB+IH2WWhkGpYJY/HEYs8Ate"
-    b"gV3uaN+pX4zlnioPY4QowCw9xqZMBJ7j+tGza014gPZ9DNnrhpIyJHio4FXp+cNhmqwokwbWSowGAbrJyFBBgXdUbEJKfhRPIVFt"
-    b"1pXdese+goW69xwDlLSq3XEURdjJRukKlUFH6QpmOBAoVAZUE1bZpULPS9CRkqVbQJrMufbEDn8JUj0VPyDJKA5MmmvcynM/WNJR"
-    b"WjyA7BcWDjw6EtuFfmN03SLDsF+dSXUmUmQ6Zgg00x+jocL4IxTOm+bG1+IpTN5rgrTLn8vcCYyijOV+CNmudMfIwSMi1QmrmzLZ"
-    b"QjmCFcJqTyDGQwx/hcS/AqZJD1ukexhhUYv3izHKGz6qe7bAjwMaRaVFgKRkrqjEVmaTGNNOdILVJO+xLglCGWoBDdhU6BUNRinL"
-    b"13pQL0cKgNJ9kuRD6cJBtsc6uTvEMH1U+nLohxANHMFo+g6vSS70/SL+JLHSaOwWT8CUwXtjNqucB2xAUbPAmnH79SM/QEljENiF"
-    b"xF72yMdT8QjVF1JX/gyl8Kp8gbz4fuvqzRu3r/3hdq/c0+hUxa3ouFsJ+q6m2C286P3Wl3/85strN26NVajvQb1pjlhT1XKq9Xbj"
-    b"X95uPH278Ze3G//6duPf3m78+9sf/2Ld10XcOEkHfsTu0tBe8aMRrRaFjVMNrxhpWzd++9VVyyVyghf4Ge0nUWgbxWLxFIv2B1gs"
-    b"/rw4q7AH/mrG7tL2p7OzFz91kAKsTRm1xUoB87M2mSV+HBJdN8bq4nS3KB1DX7VKXJb1sqUkzWmMZWBZWfGy0YJtWbJIWSk8Aspi"
-    b"POK9WK0PKo4UY+q1c8VPeMzsnK7mVU5Chczrszj0o8g2mI4jtTBymg6aJndKHqFwsWyoauVqPKwBm1XpGkstwByzYD7TVYj8OFhK"
-    b"UjwJMKWOz6Q9rhQmMXIQ6xPrcwvriPiO1cCUIoNTqzOf9aaw9gfMVjBM1JVVfki+8HPqkpwNqItEJ2nIYqhtfz/y45zljGbET6k8"
-    b"RRjlycDPWQCjaEri0WCBpplXWcH5iou4jUMBZVNymRIeKs09g09Y6OjMdKUE8A1WX6sIooixeoo4qpVVDXi9AfB0HbAslJbwJBPv"
-    b"t1qt6zduKy9inCPaGc2dFkDA4gwwPWV+nENBhki34zEow2gDgaFQHYYqD6qdnmAYkMLUWaZrXaxxI2wtSXzJoMSs52gbgbMEbxTD"
-    b"idCErYB4izSHsa7sdkwCEIQGiyWq3tDPMn+RSj1xiXQan7gkWaFp5A/bM59Wz5Zg2NhRR8ey5BGEhkbapCNbAPtClATLgB/0Fgtj"
-    b"qTUfQ41Y60gJUY5tE4tY3p8SFtvYUNbTDFcC5GBv7YAhiXMWj+TZiyQqzYGiiGW5ndJS1Kk1fwtsB4EYsIHmLPdTNHA81bWnXTRw"
-    b"BAWnfuwuJVOaSQb58KEx6PSAxbYEMonDTQDV8w3NNA/OpuJQrriDIzsIoevhl+3MyUZAMEVmuh6MdoxzGMUYJKBt4KvSh2xOqb9s"
-    b"6lIhuSSV4pRKEkQMDsx6dIWFULy01TiXfD+i6VoPVVq/KJej0EVswODE6uLFaTPeKAAORBYcMqZNasT42VmDAO3Ll9od74PLXWc+"
-    b"m1zvuL/uzmcgUo1F8gbZh0o57ZIJ6Qkk86q+oMTmlNpb9DapjsZTLiJPlmkM8lfuxoMT4qFtee4Hl+d+bTud7l//56+vrYomF74a"
-    b"5jrkoyo/QSRgyypq4ZhyELZWBSyXq9Vp4K+C+ipKvRTWYFvEcsm0S1Sn5IjSMtCt6WnHgaNFxUB0Q6sBTYe5VGpjwVLdtaqjSM21"
-    b"QfdnWhnrzBqXutR440RzIRnFIYSodtMScLSLSIDa1rlAC1CsX4L9TJGOgZXGYbeFQNRqQWns6sqr7gEEI/mNqYFsv1TV9CkyO4tC"
-    b"xM52m0yrQO/Hyxj/QAoaoQteuh35g4XQl2F2jtgATiuJDFB1JXGkfyn1RA6r6YkaJftcMqU5igxVM4prM23NvTkUqvIzirO29Xbj"
-    b"vy3thjUcyYk7LF+y5eIcyVfLAm1S6508YzKNw+apkNoW13TsfprcpTHeuHBJFiV5Jm9ftLCbfKk9CotDujpHWCzVMQuSlM6RfpT4"
-    b"skG7tDlI8OUQthj7UTZH8tEwAqVJXeJ5HvhCCfsW9dNg6Vq8yGI6VxhGr8dilvd6dkajvqtOljNQSkiN0jac3boE83J8NjNnGvU9"
-    b"NYG0JV5bvTvVUQtrPYa5kuz2wiTosXCOMH2RoDzRLq8SaFD3q7C0QzXxeaEvj7lLOGcQkqziZDMpAs9cjZ/vIKjmsAq4HUUMHIEt"
-    b"JKs9Fna1H2M1Oli8kKwWi8hguxCC6iwClrjA5FQMis0Ru2RBB+5RqIEd1sVGl0wxB86JV2iaUXWxp4rZzHJqWZQifyEJ15xmbnar"
-    b"sDJUKWmd5zJVUp0ERVQoUqyiVyW7qPhNWesYKJlZNkDCjrMBlW42udM0Xd5/0mu6V2pfnuR+1ItovJgv6XgM/7r/d92B/BG9tGJ9"
-    b"Nlr4Ew1yDcLLaBzCXUBTMhUAfUajsLYKTQkAl5n7al4LsvAJ4KIhTFU3DtXNnjqUhm3kOCz46L2l3ldW7mFdIsY1rHFKakmv+YHs"
-    b"X91Nqe7Hx9eCWxAy2SYzZxFYqRlcxF0kbLV1HeTcq1y1m031jx8xH7hZvT5n7B/xzmAte66RV9c/L6O50l8b4aM7cOCq2DJdO5sW"
-    b"+NRhdRBAl7TLu13jiqTdleRnlVZD8bPRwMYJHobdTO/UsA14JaFVVXLMfLABLzZBk1RZaHJ1C4sJ3KasTNSdOsk1jVlTL2kzhlYX"
-    b"UndGeprOUaz5WG3f0HLgZmSFU0mqcl6ZQlWBdaZmuuOCGfNwHfkiN8xGcIBPxbmp/XNltyyXd9aq5Ay9qLJlfBXyhgaLDYxnkG64"
-    b"1A4+F4QX4/0Vmuq4AinhTCHGj0klpKnIoiVckW4p0zsUrsShb7zgfeqSGe/iLPxV2adeAnPJmLSrjhcUo77H7ffh8skKrYUHTK/G"
-    b"2YTwNXhXL9RVJGotrVFRjMv0wKadbBb4EVChQH1M7Gnv4iyZJNPep7NkouSgAtbsosG+XekDC+Or1nHqn4IDHZiLPlOSMiHBtJpR"
-    b"5H3krZ58No6x7EDiKQyUueSCd4FMAMSPiT3jXSCTJO+bpibTpLAPMRgmz+Gdei9KFmeGdiVJIlNyx5JkcG6cQbI+7c06ALip3TEW"
-    b"pPsKSzZp1sur5580zmjdjeJeETNmuLsEGwPorjJG3sDP6ACqlYG+gf8FgLsOllXa0hiucpBetVvN5oqEXeXqyjBx6xuxRbYAWSZm"
-    b"+Co5bUPN1e/nNMWnBdpPUiobs17Sb1uWIVa111FTMWxikRWmF28SRNkJYBo3yxXGZUEyxAvORRaNNUCFyiWdLm5NNWpZQS7yZHML"
-    b"YuiOQnRPbS9QuogHbruWlGNpwkinISnAnnEzg1XZxirHpsKAasulthp8DjRkkr7HXp0+huFSWw6H8q6W7QJ4t/eWbNLvZzRvQzkQ"
-    b"9sTtC7Pmbs4URKEzhRwQoDu2Illdb5ubGshjJLMzFLWUWceURWVwKZ7S+xdHGoZ8gQcFCMTbkQuak1+6ftPFbVFs4xDDDqRpK15h"
-    b"WcHFS4RtKxv4KRyraa78v4wEIau6mfwxApYSL7XJdKM1mNuPv0EEioRKJa5gu/Y/hTFiz7vQg5klIYUaj2IJzpcLYpmfBYzZTmng"
-    b"6ncQHstCtggF7kq6jNPkaDgDUidO2FolJEnZIoObo/LOrywAydljxWE9FnFmkKPBpq7mtxvikfr1Cdar5Hqi5A5seYz8vOGnT87Z"
-    b"gIoNYklz0deQ5MMvM2pTgTO1No9lcG+Hvt+i4IOLIe0SUDHKKJydy9lxqdeilrEHBChyH6igkCnc643TZgr17K2bIVGtIGMLP3ez"
-    b"WVPLs854z1OHsT0XhJ/ab6CaN23g194Px5k/ghoX81mrLcCdjdGQuBeyLPDT0Nbsdd5rFuT0pRbXVKks3eiNklSCYlhEV1mAIj8n"
-    b"qda5F8palr3MEm91dTL905kgSkbmbcYuQANlLsn8fJTinZXmfK6cbzsN2jEWuCq5QzPf1ZohNk22kd4Jg4wyowvpMF9SxXIMCC4e"
-    b"U5i86+lYij8k9eLITxdplts41dWYxgqCJQVY/HMKg/4ADFolm5YKwmapa1AgrDUbFUKj+iWlVN+XmrIbcylAgSKv5lR0rUPmt2dm"
-    b"zBVC3TpxJQQPiu6SFldKC84BhvlSVU1oxPqVdTQEirGfuxVH1GdshKs7aRN6cxgYC9LNimUQ8hFszpLheM0GshoW50ARHhDY7Ayf"
-    b"p456C54V233QW33GIlsa5+tjE6j7zJCP5U4s+z7NyyR8nDFqo1WwRlm7PnY+2yPBZwJ2wv+IOzbYJmI+pyaqekKV0+PQTAVvtqiS"
-    b"xWNGVeNqYX2FlZWWjWOy852eOps5v6wtLbWnSgFtMuPNzFaSysIDoy1Pe/8gj6bhA4xWRiLnuyTyF2gEfIfNsnIuWECBK1f/Cb86"
-    b"gMuA8kLeseW4cLRgWppJjTHlWDyGiWLbqhmxPO+Sw+Ca4jHc66rpI5AJpupKv1oWaTR1jSUS4K9ysGWd5MIn6kyu0cigA1JuLERd"
-    b"cPE+g3K7F6ebfL8hJThLwZ9qAgMNQRe+Q4sBMo5zUye66gd5sx+p1AKxbG3cdKmiYX3dPjazoTIpGYuImzdisu+js4IaHqazeFEn"
-    b"ygUZH42XOlm1BKuYpCGcwWRTnNPejLZuPct5H9FY/L9Qc+EXSK9J+QvK4gd7u3wffzWwCeevGoj8iRpYYSWWTZHqxct37Yc0mHLH"
-    b"r4NYQ8mn3PIq22pIlQvnjAflCvpHDa66OYGW09+L29Ozn5CJAuHHJkLTo7E4oC4ZxTmDZK76X0ToKCt3n008Qi3D+5Nw+m1QinDP"
-    b"4g8S2pyTwTQw5rFyCFL4roVPgCednf2b1Ur+tAl/62Uq0RKrnzkWa6hFGeVvJCXj57iaQBlPxtKjv0HFkX/FSmTWWuymyoxprjF/"
-    b"UL0q1J1zvAfX7yobSXUp9bx8wbz5IS+gjl38OP8MazSwK9k/Xg2c9qYrFwNVYoEEVi+MvAM8kGfeT6ylQg2LU9xSiXylAouiBCFX"
-    b"OFpPQJt2jMMCaB1gx5Rfh3Wr/lbfAYHt/xk33YoqonFPoDhjPucSXAUPqLyu3H/JcijeG9qrUbrVuwylQjpmdqY0A0C2/hdQSwME"
-    b"FAAAAAgAD4p1XSDod6MzCgAAKB4AABYAAABtYWlsc2VhcmNoL2V2YWx1YXRlLnB5nRlrc+O28bt/xfYTyQuts6/jTk8NM+0kTnqT"
-    b"5u7iu3Q6VT0ciFxKiEmABkBbjsf/vbML8GXJvoc+2AKw2Bf2Ldm02jgQZtMKY/FI+vXvVqv+eyPc9qgyuoFC1zUWTmplIRyWWImu"
-    b"dqUsnIdphdvWct2fvx8uWyectE4Ww92qQaH8oZMN9tstmiovdKccmlzZIw+xKIUTPUj8w/kv7/Lv3128/+1DCrz49eL8X8P3384v"
-    b"3px/SKHYYnGVl+IuhUpiXaZHsP+ptShzwm7RpX5Vo3NoLK0K4XA8NVhoU9ok8IRqI9XA+AcUptie814AsNgI5WTRg5yfnatCl2hS"
-    b"EGWZN7rEOhdmY4+OjkqswKAo8+sOjUQbkyqTJbNsERVkYNHFCW9U2kAtFaZg9C1I1XPGl1KIo4AkSpOAgj60eZfLEjKvj9jo2xSi"
-    b"fjtKIZJllMzhDwETpMOdo//XHVqyick9WYHSbiSnzbimxXAgFYs2ckgfI6RF+LeoOzw3Rpu4iu5JrIflPYn8sATctVg4LEFAp+R1"
-    b"hyNGoUq/mLBDJBaiLOMeajy6I8lgOEj93XQmsb1TbotOFnln0ZDIjZD1Wu+CysIqSiYGF+/rtxQOCVzYXFdRkiSzNzdYz17coO1q"
-    b"B9nUw2L6k3ytQRCFLzOHUU2lLvbh/OYEymCNN0IVCBlI5QhssUEXR8NBlMJp8kk7CdS0mWD8Fk7mG9/BKe9M3s7fS77WqqS6EbWn"
-    b"W3ZtLcn1JwR/78pNg8odMqx9Jkag/p6FLLzqqoe+nGpioDTne7i+8pgvGU0ADabiOqMC7mBUDTojCxsboa6wTGGj6zKFq/D4soIa"
-    b"VUzW4wGSBP6U8V5Y909B9+j7FXwLpyNje8qMznuXDA7p8cCbH2wKrbbSyZtRhZbddNj+Oah0I6QiLa2IKluOFzmFk4QNPBgGWTej"
-    b"Xy2vLr0OSeay2MQ3xJKd2HhQju2aOH714gWfwzGcJvCSM9ui1ptXLDV8A688GVql4EGlAlRdg0Y47LEnR0Hvhahr8sKuidda1zEJ"
-    b"4FHQN7rLIhEt0i2J5SVVZbEh3y428QBBC6uNw5IBF55YnFDWuUFjMftoOkxIZo/EGMhA4c7F8Sm8ZK4n7PccjNwzJXJAen9mNYWT"
-    b"xUkyNyKSKWUGUzAmmFOLpkDlZI25QmHQupyoBIVQ1KQ0V+MQvLzSvTRBa6tG7OKT1Gu9QFnHpJNwCC9GHPw8l4EyEgBx73OtD9CS"
-    b"aVJAS4FyqE2h6JyuKkvKalG4lHKENi6fmDxfAGnZsN9qNXE0WXEoZQh2hfvr1ckla/OalBiIPnwipES/ejg2797YYWN011ooZVWh"
-    b"+Rt0FqFTttAGy8AlE+pULdZYo89flLvHGMKMkCPkKaz1LoVS3E34mrMVPIXPSaDVtSwv5yAsM2TglbpYUzDqHW6kOtGOJL2Rzjjk"
-    b"rvWORQzXQ7m0kpeLMTOSFtd6x5EkJnYnFygVEjh8R4JMvPVTAftalg9LaKS1Um0Is1RYy41c10Ok5vTRseLvS108BC36x8/Cf23g"
-    b"/mGSZ+kkbJTohKxnG63bQgZkvi8GMxvMa8i+ZIikczbIUSQqbTmojcHedGq+QdedkaIOoW2DsTfjR6phM3hcqgSVp8CFxZNWQR/r"
-    b"BHkkZI+L7FBETD9byVoJL2a5tvVpzvtcRn9SqGUjXcY6GljJ5ixl/Hefgo/mrJtHhrSVbiFVibvLRQj5JPlWOpKOGBtVN1PzQrQt"
-    b"qjKO98SD4154CrWn+JeDVu7fIMvg5AmT7FRP4n4sk5aTNwlFkY2WvXgPkyrKm9aKNMdpvFOTPMWBIIP7qD07yRvCYHSnyvip2MsS"
-    b"p7A4S1L4c3KotYna12dfgun1s6hefxGq1x4VRLQz9DTRkhMhQx2m4+PiBH5IrjufWXdDXBsy5GFMFH+xzG+l2+rO5X210eOkJLB7"
-    b"EqN3ffoQxBVBBNefW4a/QCYcDyWXvl0NZnAZ8tSKdweTubykYixlZRw+nxSQ8w9n+FDid2rIaxy9HyFJ5m4iq8DuvnF761tV0QXn"
-    b"/7/fXz1EbKH82Nyo+0zdZ0VepJATGyGFp3CWPI1Y/fD9T8+gPf1KtL9cXDyD9dWXYaWkUlPzsjp0ncPJiILU6beyDE73AxKVFIzv"
-    b"iVAykeDYAx4UxB/N+Q05a4wjjGu/F7BpH3L6rkBIFYecwvMeqiD72c/iH2bDefM9n8Ql2sLIllr7LDoPZZjP4r5oCSU+BXvw+aGn"
-    b"G3KuJ0ENEs04GHccHR+HaUqUgrtrMaMRUQpbrNssemc2Qsk/0MB/37ynLI07ZwT3FaU0WDg9NPZPIcdGRykIHlNlkXXaYO5MR62n"
-    b"p/GjNgWC2yKsO1m7Y6mgkjvXmaHiegJ1oU3b2Snbz4IPE5jPhfcN+mdC09tHNHDQskCbrSJR1zRdqHEnC8Ff++ETf2+EcRSNwjgh"
-    b"Y/hnKVz1vEjlUlA0pcqib6IRxeo0hbMUTk8un8XjK5kZsh7D6bMXdefabmYmz4J7q3zE9kAptDnzqVvsUYUjs6FAHrDzPw/kj2UF"
-    b"Qt3FqmvWaKgb5tgQllJB/IKAF1cpI1r0bQgvhmJxUs8FOugbh5/ZsfwlaDrrYI1DgxyNHBA2MnEGj/3SuxN5C6+9mQ7LYIbjmnuc"
-    b"p/jwDgSFUJQf1wiFbtZSYQmUR0GqtnM84+19xZm7EVfPSuZbhRnDj9jD2iI85n8+bp0UpZWuSw5W02FtPIxlPWJRbDEvpeH+tsfK"
-    b"dIibAVdgIHusrTgQeclFHJuVXdAgvI4IYThlfJPx86NhaU666XFPVD9BHnbzEm+eQx+G2BP89HBz/H0vE8/U3ZNlXFPCjOBTZGmO"
-    b"Pik+Qkneqz4sY6+2ufBEM4NaWhfP5tijYg6P/vZalf2++q0eKIgbIWuxrnuvGFTDiXAYpY7aYnOYKG/fItDP5CEb5/PetXyk6E1q"
-    b"vnUQD/8ckM1+CYiHHxMCmT1zHe5z50jlxyei+IwZKj84mHuGVsPBbLjIuz6gcujYvz5/gnlU+NBiIas78GkHnO5LANHXTFQLSLWZ"
-    b"DYNDCRKOuJn8zGHOZ0TSJ4SbS8Exa3K60C2qOLqNwmNItcmizlXHf41SUHhLg+As+p+KEhAWDmF8XIEH2SZaf6LcmzUFXONNN1bL"
-    b"mXT71SS/iaGhOvnuouyaljsNEsR2BnNhCymzH0VtqVisZI2Z53/U1N79+8jqzhQYLSHiusnXtD48ZtMo523LOtM7PlcabNehpQur"
-    b"g61Y/xl+lPJXwopx+cnXobYvnkxsEu5yaDSXJHvDuedJD260hOj8DN69ffsfFrf3fRYw0lVFNgBOt7IgIxfK0k9bz6J2siHTX0IU"
-    b"zMEXyTeyRFUgjYqKuiPP/ufHj+/BIg0Z5B+CfzOjn4/I5qmx9g7zcOhJU6BxiHLZqxBCcVdg6yB+94EjZDqJlmy7uCv2U/xOuvg0"
-    b"hSq6x13xQGZ+dHQkK8hzJRrMc44FeU5dQp6HgOBbhqP/A1BLAwQUAAAACAAPinVdHse+0XEEAADdCgAAFgAAAG1haWxzZWFyY2gv"
-    b"bG9hZHRlc3QucHmNVttu4zYQffdXDPaF9EJR5BTZrd0VigIN0BZ7a7Pty3ZB0NI4ZiOR2iGZ2A0C9B/6h/2SghRly03WDV8skjNn"
-    b"LjwzY9V2hhxIuuokWZyofv+HNXqyItNCZXTliVC7fOWdJ7SQZD6sCWX93pjmYoOVd4Z6jU66daOWg9h76db9hVMtDqcd0kpUxmuH"
-    b"JLTtBTw1jVrm0ZNB0FODujI1HogQfvZo3c4Gmc32B6nrBimDpVdNLUyHGmnSq+W1dHKQ/v7izTvx868Xv/x4cZmu8UY2XrqxexVq"
-    b"pxoUGiWhdYKkvs4ghCw+eySFdjKZ1LiCVirNp4sJAEB0naDcJTT/jq58i9q9jze8RluR6pwyumRvUFpPCBbpBunEqjp8S6rW0EiH"
-    b"utqCWYEE8lorfQVKWyd1hWw6MpbLuhYyWeHs5GQpLZ54algGNa6kb1zJ1s51i9PT2dnLvMiLfLb4+uWL8+MwKUiWgdt2WIZn3AOO"
-    b"U3gUhbBD6QYQpd0e4/yo4q2hayT7qObsqGajWvW4xVlxVLE1NbIMqrVRFdryI2twoyoZEskstlI7VcXvVpJjn0bp7U96cElXFsrB"
-    b"RvwJVizvr9UKtHEwg1eRJDaP7obdrCjAUH/Ypw1ewWx3lBISznqujSJBIkOcvY5QrbcOlgizf/76e1YUgbMRTOoaBpBBpjNWOXUz"
-    b"MMrRdo+dCAAlNMo6PmY+jx6lzbTXHQWXLvZQYZFUFuE32Xi86N19a3Y25I1UjVw2wZGdViiuVOiczG0qsWGJLGpvs1CAzdJsMqjl"
-    b"Fkogc3sg2EmSbQhj10r4HfvMFoM6s1vt1uhUJbxFYos9IIsiopYO2SLAZ8AiSxb9m4TvDFjPuHQWN/f7nIRlnSSHdaDFYd9LpBhW"
-    b"1SjUDsqDFsbH3Y3f3Y/yHdatcuukmAcFvmJ30ZHQB4SnJifrSHX82emz6f2p7NRp32O+veszcx9qRbVovCvPiilIC4S2M9riYcYj"
-    b"Q1QbOlG5E8nXKGsk+5Fd9l3sQ5Rgnx6oxhZcxtGSN0bWfIA4jCfxKBlSFt4ajaEKArP60zzm04bIOVvK6hp1/U3tqWTTQVDZoVny"
-    b"YDe/QseZcthaNs0iof9Dpy/T9GLTYRVeL7Xmny7fvY3F5NYIyTocBA99TlJRHaCj86Rh1RjpeAqmk+RUGAiclWz68ezTNAP+gCdw"
-    b"MrBoCqcwwxf7OokMeDiNeSs3IhV8OW4h8Yk7Y5rDDKRQMiDjdR0oAyX8qTr+PMjmrex4qsZsV7fPx+1qRMxuPhex5r4wSPnOWD6f"
-    b"j9RIaccjQ2rfdpbfsWTSsgU0qAe9aQZsmBCp7tL20XLMHn3qfg0EEt15IdoA9/8+nxfTp0HOz58KOT9/KuQ8QcaPozpV7Ap7lfiw"
-    b"gVqP+rJ79v5RMvjquEde10jCaBQWK6PrnU9hRBVFcZ+B0jVqV54lZuCmws4Bf3cZSysblVnkJG6qh6NtoxyfZbBid7ip7n/XYUJM"
-    b"1AqE0LJFIaAsgQkR/oUJwXr9/i/Z5F9QSwMEFAAAAAgAD4p1XRUnEUKLCgAAuBsAABYAAABtYWlsc2VhcmNoL3NlbWFudGljLnB5"
-    b"vRnbbtzG9X2/4vShIBlTlHZ1saWGRY1ahgUkthE7QYDNghiRh7sTkTPMzFDezUIPaV/7OwX6UCS/IP9RcWZ43ZVitw/lg5acOXPu"
-    b"tzniZSWVAaaWFVMaJ9x9r5heFfy6/fxRS9G+S92+6VVteNF+GSyrnBcdiloVBb+OFP5UozaTXMkSKmYILTQgb5lZTSaTby6/u3p3"
-    b"9eY1xOA9PZteP52deZOv37y4/Cr59puvIIbcWxlT6YvDw1W9XHKxzFmKUSoPv0chb9lhWReGF1wsa1Yc4OmBLllRHCrUsrjFw22L"
-    b"/86bvLz66vIdxLCdAAB4Rt6g4D+jikhC72JvJXRwpcywSH6qmTD8Z8wiKcSaoOn38MHNcHLXiPDq+btXJFn+7Gh6NMuO8xmbzmbn"
-    b"+fGzp9lx+mx6fnR+fn6UPTs/OT2dHuPxydPrI2TXRyfn+dMMj9Oz/PxZOj0/9iaTSYY5ZHyJ2iSkap/0GVxYHj9ws7L6jWSFwvfU"
-    b"tRcA07BiIivQwdCj0NRKtAaOCE3iUPoONARPr9js9MwLohWum72gpS4/iEKyzM9lkaFqiLuPqLzJuPIrplAYHb9XNYaAa65NIm/s"
-    b"Z9BAKxCsxBAUltIgcAHWMBE3WGq/QUqPYWqJhlzAUoBDe7Db5nkDEXHtNBIAExn4BAV/iB+xHEg1UqPDEUAcQ2+zARf0pFIYLuqe"
-    b"dqW4MH7uvWg0wsUStkT3zgshL2q9GohsZcGySshCEMNrKXpMRm3GtKwtx/ET1aqwhs29bRcad4dbp0EiaXiJsjbxyam1u0JdSaEH"
-    b"lh9hb6M1es1KzN4jBSRTm5ekjoyr2Ok7BF3nOV/HXlQxZbwQMizQYPySFRotHVmbqjb7VHYlplj3HXBEWur1MnxcSolSWW2IO3n9"
-    b"o98KEjakxgd5bj2CTPeIrckfRsZumQrIQXp774ugGNcI37GixkulpPK9bwWuK0wNZvDu1fOD2emZdWazQnjz+vX3YDnwxhx29CKF"
-    b"VcHSzt06qJwLVhQ7PkCu3amPaxDSWK/ZZ7MnUIuCixu/5FpzseyDbjJJC6Y1XJ5eilRmqBwSiuck4YKbJPE1FnnYhNkwAHd9s0nd"
-    b"oi6rDdlfVA9tk+pVLcgnrZMoM4KyxaBLtbo99b5d6YBxnWJl4MruWyMQOlynY6b2LXUltGFFARQ+XGFJGelAY0m+kUZmbcBIQMGu"
-    b"C4TLUy9wLOE6nfQBzsxKQwzzUe7psleXtRbDdERmYkVhM/MgKdEhZ0nh8AafECD3viZfsvhyWYuMTm4dJ3cRfFMLqDZmJQUclFAy"
-    b"XmhkKl1FrYhdoh54I5k4EhXEQ6PZxc4UEPdGiEglTgBtKK2blZ4fLYIdhH3FdOpMjKpFygyXwi/ZOilQLM0qnp2efepgxTLKon7F"
-    b"soRn8Q6QfUuMTHjme19WLPuzF4RAsHYnbtc6IrIyZD6pTPQOteZSvKmIK+2PYSIujGKJrBJRl4lZKWQZHSy58E9CkDpKqzpJZS2M"
-    b"H1DpmO6fR7V/fjoWVzseGo6uRI4KRYoNawMVTxdBCASdSMdvTFRCqJS85RkqHc+9v7799nKNaU37b5t1b7GjYC6q2qpgi8KojU27"
-    b"FyAqYvh4Rt7q1s2mcgnUoNBS+XY78AALjQ342Yl1YQtPnjiUKFqiSRwtP7gbs5CydIXJDW4gBt+7PIUuO0PJ9A39IBNAifR26oXw"
-    b"hb/X3jwQO8Gky19oE1qTvQyunaIw5+tBhFUcUyRF7PkdHU6umUlX/twdgycWjcvr9MKFwzvQLlOKbaxiPSt3wjPtXcD8luI34pm2"
-    b"p+2XZdqSX7hecvx4zBgUZMWE9NEjGa9/Pr4mSjYVjplqVx7E1ButdxnnLE3KiKzEvpN7TluLEDLCGdu/waCnswudjziEbWPXE3K1"
-    b"vDVJ60mqFj4VubBhJJgf9dnVKiLuWdIjpnY12THYwueFZOTX8yiKQltKe9S3mBqpSO6mRYEvLLkg0nXpszXX8TSAQ7s2XIrSglf+"
-    b"IB8IqcrO0UQVFVTalxEt+w2RENzhEG4Qq4yXrlNuceHBs2C3WW+PUgkiAkHENMnm78gWAjVOTXPWVf0XKDReiQzXj5b9Ao1BYq1i"
-    b"WrMl6rAJLBWCDeFBMD3QAHxGhWnQQdwi3kmOhinrd6KK0rokFc+PFvAE5gUK3/qrdk7m3l0ucLzOLw6mi0F0tuvJ9SZxglERn+fe"
-    b"1n1Fur7+EVMTaaN45Qd3P4itxXrntUuU5T3//rePf//4y8e/3f96/0+4/+3+Xx9/+fiP+3/f/xp44zByPPXu9PBDRxwH4UCKn3nl"
-    b"76k/6HHZ3EMCOGoPq2Ag6u8ylnOxRGVvLhB3d0B33fPpwhtldVlpf94Yqc/fTXJdkGPoWmHCdMp542qNdf1gfGPsDWJvABYXHELu"
-    b"Ne58sB3wcxeJauNRUXJwg5bXFaLRlck6TR+1oz2eN+VigIEuAeOWbNx/7bW546xAkUyXXkIRUn8nPyQVT2+K9ia0d5bn7fFIZLyk"
-    b"8jqzXFh/djv2wknfVrXu5toeclk0tqSb6H74jrWjieZtBNo00f6bd7a3DAd9ZgiXb17atx2FtIE01OqIFNcPXEfaO7G9ZtgLcS/e"
-    b"RXjX+StIkeKf7L2JU2IibAprjRlIYZcFld6C1SJdRY/cp+mxpduW9vk4/CgMbFKhMFBMLNE/ojzXchPC8ewBkRt8EasqFJnfhkHj"
-    b"3/bo3KK9cMifwPFsEYLXCHYB3qA9HqrOQpOB3dsfYXo0OyH7Hj1s1laTAFtHL7yDwx11/o5edrzClks7wVjWsm4KJ6VaSZ06CmbQ"
-    b"b0QP2ro5KJm7F9NP30kt/eSD4gYTG8+ul+v7ttGeK0KDYZbzPrOiqQMK87mDpf9hyvKpOciAi88YhuwO2x4dhDjARwYhbVXX7Ba7"
-    b"odzQop9OQftDB6f//9/IoTW0YuKmMfBPNapNCDqVFYZQ8JKbgb1t29CIvtOYtRs74Ti3CCn87AsF37Bf1LzkBVPc8L73b0PiLw3m"
-    b"DvgaNZVEUUUlW/OyLiOFWZ0iM/4QTzhsVwbXLRLJttcu1lzCoWAlvEFgUwDBtGmzu1vRHZsbVL6WymDmW6guBrkYjImkcg1UR2xu"
-    b"SS3ppH9AhObd1iKEGy6y2NOGrtZeML+w+l4sIiMLPirPSLdHkSJ1/X2DTgmUU/K0ZMcu4HJYPNTFnI/zL4psFwCewHRBmrBv8KXN"
-    b"xkN1OqXY1YHKx47dMjvnC4iBcqRTQsnWo1NNlkaRDQcWTT9tRQo7XM1om2VZ4kaIpFTKNrobhbmPiECYWtY0TvK9gwMLfpBxRfNX"
-    b"MhgFdwglGnbLVOy9ff7+lRfCCosq9i7dtKmQKSvg8rQZgq24howr642bZnrxCDWbLPepZZizujD2y/dcy0ZlyElVMi7absfhhbj7"
-    b"d0/0vEH/1u74GepUcTt1iLvBdtOXKJ5vbGnuBNgbeT7IdyrLkonMCyFdSZ4ijS+64VTTtv936s3GAlso3RZesh3ELUb74+zptkdV"
-    b"oPtnBgE4PEnGlYP8na7J5vrRELIhh2tu/GkIubfFdXr3g2gV01RzN9OjAZGdomzHdO88Mhqn2xkVhiSxQ5kkIRMmieeoOXtO/gNQ"
-    b"SwMEFAAAAAgAD4p1XbtZzolbCgAAvhoAABQAAABtYWlsc2VhcmNoL3NlcnZlci5weZ0Z227cxvVdXzFwUQwJcCkprZxgDQZwEqUO"
-    b"0liqpRRFVYGYJQ93xyZn6JmhvRtBgJ2H9qEFCvQ9KPoHRmDHysUK0C/g/lFxZoa73NVKdrOAbc7lXOfczataKkOYGtdMadjibv1Q"
-    b"S7FVKFmRnBkwvALiT3DtTibG1N3uvePjwyPDTKOXZ7EG9QRUd+UjpgGvPYDHDWhzj4m8BBWR44kClnMxtjgsiMNRMzMp+aiDP2Rm"
-    b"4g767NSgijSTjTCgUuGpN6os+Si2Ei0u4iJ9rCM81XXJzZa7HOfMsO7WJ/tfHKQfHzw4/PIoIg8ODo4jkk0ge5TmbBaRUrI8xesa"
-    b"jF+VYAwojauMGehOPWoQYy4WLBwBU9lk3+75CxoqJgzPuiv7e/sikznqheV5WskcypSpsd7a2jq8e3zviCTkjG7TIQkoFzlM44mp"
-    b"ShoRamBqtnFxh2QTlNUkjSkGH9AwInRbm1kJOs60tqC9ZQeaaX0Vcot0P7rN6jp+6MD9Zwf6kD1hOlO8NlcwnG9tbeVQEN1UFVOz"
-    b"wKkrHFrECkyjBDmjucxSntMhccexW0eEVoyXIzldOVzuRYTqZvQQMrM89Rs9zpF5DSIH1btl1xGhaM09usxARGit4AmHp3RIKKHx"
-    b"Q8mF5zseyXx2Mtzb2zmNrQkFYXgyfO+3O6coZ1YyrckXjJfOioMNlu0lzxlUUqTGXtAkIceqgS13BAVJUy64SdNAQ1lYS1CgdUSc"
-    b"OUUkh0p6TPjTTQ0qCOMF2AIAmfGOFi6vQ1l0lpl4nKuHiJ8klszqAdMaDPJ7hs45JEGAPkK2CX0KI0q2iWAVhDFKlY5mBnQQRqTi"
-    b"FYSkkMp6dEQCvNRtc0GsXcfcQKWDcFWRnvdgc+zolAkFeaq4gVSBrqXQ4PWmbUCKCL6ao2f3lIE8uS8F9FQIJas15CQhwVpECUIy"
-    b"6KBCsk124TbhRbdDoNRAENmqotDAeuxYRsINVybAclAB/VgKA8IMjmc1UK+bd7j+exBjM6EolgpKEAGKGoY3grJsAgNEoKQNHEIO"
-    b"tJEK6E1Qfxr0ORwc1IZLYSOAkFrworgRuoM9gqxR3MwGh7Lk2YxG5FYOBWtKM9AqQzctC3qHSOvCbktIAfQOGTENg0bxxUahWAUD"
-    b"JjJA5rXfv3UTFw+gAKVALamj7Mrv9gTgxcIeuCZCGvvAS2PZjN45+OCYV1yMaUQKOmLZIxD5nbxRyZnHOIx/U5yvK2uJRgfLI6Nm"
-    b"G2g+LXgJsbV399pLG55mUBsSfKTkIxCHvIZ9paSKyMdSCMjwxR6ABmN3e7aPv5ppvYw/mP3XnQkTW+dSyTLdxwefX+tUNZthjiSJ"
-    b"RRjnTVXrwOEBoRsFKdMZ58mnrNTomlAzxfA1k4BG+DxDGoYx2ITY04tTw5rDe1f3JCOCOarkGUOpt5H8empacB0u5c5l+rv9Yytw"
-    b"P7x6V0/Wi40eT4tw6u0CTcHH2Ovfs1ElSRbliCUbY4hconVaVKzCmNtVMEGjyvhxAwqDGpumoqnSgkOZ62T39iosCjUGEzyCGWYN"
-    b"62oJpWuP38vFjli8gDnxQKfhyWD3NNZG8TrwGuu5C3KEnGM472vA5Yur1JwRYJRbU5kDOOnwnV7H5yYbWDPKJY3wWnaThNDtgj3h"
-    b"mRQxzyQd/kKC97FqvH+8f/84IiOKtssrNobt6QBR07dwwGq+XYFhbyG/6pZnXXUEWJSdnFFbJI3kNCLU2qita0Rgy0TQ4blNwfbc"
-    b"b9nXkmjbgTPV2GLrUnF4ulpFveW3QtTj89UxlqBdpWt5lGV3IwehAc+x2KDDFWPArfN3UJ2jskF5Vs5FjROPZinPrW3jH9RXL1P2"
-    b"KDiwa0P/259mVfoTi+8UpeKs5F+xUQnBBso3PTVgzMaCtP13ezF/Pv9H+1N7Sdo37Sv860X7ffuyfdW+aS9jeh71urH4/sFx+unB"
-    b"l/c/WaXnTYckNjx0lkQjt9QzYSZgeJY2GjPjKiwrDCiSLBsjp067vX53BIVUcPWy21+/zQuPnIm8A8VPt/mh39rgJIxrIH9kZeNS"
-    b"XkDbb9oX87+1L9ofUU0/t6/mz9qL9rJ92b7A5WX7uv0OdXfZ/tBetm/s1Tftxfyf8ZqvlrzihiSk4iLY3dmxETfYRRfyVmQvoMO/"
-    b"t0fDfun1FnPVG+xVFoUGS41Ng50eEXeAVHaQyBXARRdqpGFlz+KVfKoh8M8bOUVGXo+Rpxc5If8/g7QxAuPOWmdng4z7xvDiGTvF"
-    b"VhFZo0PH4ru4tbbt8gY12dzXme7jtQfz6NB13T3LjwjsIiQfkts7O9f481Ur+lf7bfuqfdlezL9Ga3ndvmh/nj9rL+fPSfuy/bG9"
-    b"QJdrv8fFJSIm8+ftRftT+217iZbXfrtuTvjDpn7heDLHep/qiimzWRJ7HcXh2Cq7i/14GhFawpRnrKTn7yzYN+2r9qJ9jeLNn8+/"
-    b"bt/M/95+T+bP2lftdyiBc5KL+fP2h/bFJiGYTmWxIQjgdhdGrMpxIoIi4j+xkXgzjLmWhVQVwwZ6gzlPuG0yvRE7O3APGFl1eItF"
-    b"Z9xs2JaNq3hlY+oG/esk55kJOtNdC9cTbmIXssOIwBOeg8ggwd1uERHNx4KV2u76b2f6E24fCiU4/UUO5XjE2QeaxtDKe74ssRdF"
-    b"61rVv3xdwjRurprCu+QW7CFhmoWrCeSju5+kD/b/8OX+0fFaCX59jvrP/Ov5Mx9R/4oR90qeenFDnlqU46Ucp8p1/L4JwU4goQMs"
-    b"3vlX9qtXyv6K3H0ieU7qxhguxsTZDTGgKm3TyCKtLdIfPqfhBQdli6FSjnXcbwO55kIb7DIDJG0jcmhx4ZJ8mJC99WhiVYOcW3UE"
-    b"FGUkv8ZWGUFCPw+rGBeB593W9ZhQuyFsfFeNmwqEObQnQQ5uusalSOiDRhAzAStCJ+JTGBGsmXjWdfFjJZu66xlUbGeJjWlYWc5S"
-    b"mGZlo/kTSO0t38XYb3uReeoBHQz8OJNGxMxqSHAGG5EJlHVCD9SYCf4VKPLnzw4xysLUKJZhp5RzBZmRakZvwp1JVTd6E+ojw0TO"
-    b"Sim8mNjyIoV3w2sryYgw2/Em1A43UqOaTjc9nfTBJlKjnIsuafe99+OdeCfevRkMx7adDFyYJYIP3r+95yBXJ7mBQ+SP1HjR2ik3"
-    b"sHaX3PFKy+jfgiS2JrXFkhprN6xDt8eF06mbSrlTD4RZcGVC3WtePVCyMt+2jbqtDhxiHBulOVc4A8OBrVWAtkGgpMhMR2lJ2+OV"
-    b"qj9W77XMdtBNkuXQO7BgTlWWVCfjYmvDvG3RevfH60F/OB84RjCaL4brqzItkD3lZtIf4TqO0DQ8DD53uJzEdqpL+iKGGIJdD7M2"
-    b"ZVFY0RUU/3dkuL19tkB+PjzzPY/7J0Uy5+S/r8nZhm5qGJ13hRXBK7f2927ZoVWvpXKKuoVv3oWJW+c4lSobPUlw3LyaHvvkU0yi"
-    b"KL270s2VDo78PGmZa6ykK8nGWzJMucEyuaBnMM3O/9K1wB7X5zAbSabyz3CSopra9BHgJGqL4xQcB8VpaivCNMWQmaa+HHTxc+t/"
-    b"UEsDBBQAAAAIAA+KdV2wE+bPdAIAAIsGAAAWAAAAbWFpbHNlYXJjaC90ZW1wb3JhbC5wea1UTU/cMBC9768Y7SUxhEhLD0hIK869"
-    b"90YQMpsJa5FNqO1ltepWgh5aDq1Q/wmiRAjtB39h/I8qO9km7Ac9tLk4HtvvvXljjxhc5lKDxFYi8wHEXKMWAwRRxu08ABuJMdW8"
-    b"1WrFmIDElGtxhaeSZ+fofxyiHAfA1WmesMMWAEC73X6fJSghFReYjkFiD8UVxg5QhfChj9DjaYoShgoV6D4OgCtQeaIBr0SMWQ/D"
-    b"drvt0EQCWa5LghLffhL1UGbgeQF4nov2hlJipqHraEKbkVB5kssB134pz+1zgqFbjmGaj1D6LJR4mfIe+p75aSGp8MrdNmN1yTM/"
-    b"EVLpAFKuNFuT4RbDmo6VG5uR1jIZiaFCLnt9X3rRmX90SC+0oCe6pwfzjQpzTfeT9ZC5pXk02mHRmReU0hsqNJfnaDNferBXV82P"
-    b"+Vh199mqZJdUeTCoANh2iQ1p/0tS598kmRsq6Bct6JHm5m7yevqmtCZbpS5Yyiz57IV1N2ndiCe6j9QuO7IVMjc0pcIyRqOdSO36"
-    b"UfypE7z7zOw/PVJBc/N9Ugm0AxX0PHGDXZyuKKxTdew8i0Fk2i+nx52TRgrWQOiuLMMO+Ac1wPH+Sag0l1qNhO77Xs3rMcBUIWyp"
-    b"wNaKOdY96LAVu9bKQ3Pnkrvb5poW5pamtKDniflhvtgf61Cth4qNdRrkWcztS90qqFoIR4gXMR/7bHNCFdDa8QMWLEk23E5m8/Je"
-    b"J+CByKoG4hxswP/Vk4cNjsyWjsycIzMqzI25M1+3OOLaTG3In6YV83HzOa3pntW6azD72SYF3Qr3rRe6aqnrbq/pq964sQJV81x5"
-    b"ZM0O/htQSwMEFAAAAAgAD4p1XWp85qCrEQAA9jUAAAoAAAB3ZWIvYXBwLmpzpTvbbtxGlu/6ijJgmGTUTcueywYttIVMEgPZdZxB"
-    b"7LysIoxLzepuxmyyp1ity2gasKW9PNiLxWQG2AUWs9l52Zd9kR1rrfiiAPmC4i/kSwbnnCqySHZLcsYPklh16tSpcz+nyt4sFyxX"
-    b"Mh4ob31lZZCluWIiERORKtZnfhwFrH+LRdlgBkPhSKiPafZX+59EML1uFiVxDivMWt+LlZjkXjn925mQ+5+k01kNCEcroITvZ3UA"
-    b"Gqkgpnwk7sW/E6zPbrxvB9PZZFtI1mep2GWfpCoJ7+LI7UxOuPI9Oet+/kWFY5Jtxwlg8PFsu3EaZbvhhKvB+FMRxdz3/Anf6+7G"
-    b"kRr32N/dXJvuBV5AACIvKZFiJxa7H3El3J3h+348EfW9O+yARXy/x7x0NhEyHngdNslSwO/l40wqr8NUPBH/mKWix7wv7n/osXnF"
-    b"liwdvcs+StxT+wkggpXnos4V4T1gEx4n29lej3leh+V8R0Q9NuRJLoDSCJbmE46EotAIDsTRY2sdlk1F2mPpLEk6qAmfz1IcT4RS"
-    b"QpqvFcYmQnELl6tM4nrcEbgAK3t4xntC+QGbr6+sDGfpQMVZytIsEr7iow4bJDzP7/KJ6DAl9lTADlYYo/OA1rF+pa8DKbgSRmVh"
-    b"dbC+wlg8ZH6JJMBFYfnN+tUGFhi2YVf6SLiBh6EPs1SRocAXAEuhZjJFiPWVuUM9SOUO3xaJv8OTmeiwIQqOaIctruB4YDF4HqCz"
-    b"Si9zERnpg+AJR5gn8UD4ax12Yy3Ac5m1pP1hnN+O01gJf5UQBGzD7BrSL9+O9xgirFOcizQS8rOhD4chOp3ThTTNfv97+jTq85s4"
-    b"giFPf6NPi8fFU/1Gn3l1vCpWiViOdrb9lRgoQIIQobGzcqPtLNrHLbwgVDKe+EGYT5NY+d6XqRdsrm1VbHn/50GLGKaf6RP9khWH"
-    b"+kS/KZ40iAOGxTzJ/RQ1o1KsKZcqBxHwiSBX4F/f/HJ6cGf+5fTg7nxr9fpohrttevobb8uRBq6siLoJnmTq72YyQu+TyWhzbSsI"
-    b"v8ri1MdDZV9Mp0J+yHPhB0gdz/fTAStp5NPYl9lMiQ6JDcg6mDeI5ROkVuyyLz6/c09wORj/Gkf9z5DBoUiVjEVOqpQH4TBOlJC+"
-    b"v2mwbqFzxD/ZlX6feR67dq38JktApaMtpcinWZqD9fBdHis2FMCjB9f5NL5+9QDpnW9cPSDS5g+cpShRu8ziCb/KsxTOb6yjHM8e"
-    b"BkyNZbaLh/tYykz6gCEU8CfJ+y/6pHikn4PUmX6rT/QLfVY8Lg6LI/29PtFvQwgGpYAOkAL0knE66lUkjAWPhMwh6PnePSF3hOze"
-    b"RyAPfZOrOFIMpcjH90QicMAneQwzyXxzzJlSWcqyITrIEL0ogWfygyTxPbShLii5F9BqZhaFuVAfKCXj7ZkSvsdlzLtTKfJcRF6H"
-    b"3VMyTke+AY244rlQYZQNWL/fJw8fgn8mcc1LvqOTZxaidMDhmOe+swoWlfEY1njBpehB9MHC5XXfSXRsMO/H//xnpr9m+nt9pl/o"
-    b"Z/qseKRf6ROP9WDuX9pzxZHXQh91VaZ40t6lccocsogNkztYh7gICNwjeGNX2oMky8UdjG0+adHtbDADi8OQ6dpiwnP12VSkJQnA"
-    b"VKCavsoAubpaDQIIWO8sSWrnI2AvCMdxFCGIkuC2HRCJOtsVk6nadwGRLoCkjIrC3R04oxSTbEfQSlRtMo2mOltLdI5rlbSm3322"
-    b"GYbhJVR8KxzGaYROHjwNOvem8lrm4e7WGjbCIexOJM1rchnHo3ESj8YKbE7xOBWScgSTtbiCQScepyPjJiHj8BFokXs/+FlnXnr4"
-    b"rbYLD1V2J9u1XjuUYprwgcAzF3/wOszTJ15AxpAIxYYygzRlzThBotSu+nAcJ5EUhueOB1HZQ4EOBE5EVMIOCwm1skHnaY+Kpo1Y"
-    b"IE5ejmSkL05JzVxq+XQq0shvpFr3xZ66i5ka0EhRD07bIerDOI3EXhB0KJ3zJlw+hL0gSTV0EZeY5ZGzjK2WQGEi0pEaOw7tJ1GF"
-    b"ImlHWLA/a93ZboeJvWkSD2K1yL7lDHR+dbVhzkCZkvs1C6FA0zNJMZuXQQ8iujVuSOHjqMdktgtmAAkVpOtWlrAdhOPGdjZvJMCa"
-    b"FyEYg4vmL/QW1q2c63tKl9KC6posruWEbe53wMBHIGzHVlJ0ZJv/bUDCQUM2A7RsKDeLskFXimFrl/NObAnE7LUdJGzOS2DB4sXb"
-    b"2d6yPU1WvGG/nbSYosgifHyHK94mpsxFm1QtIQtKjBaSqu6wXOGQONqS0iTIf9LHxaE+pmTpVL/Uz/UJJEz6rT72zt0tMnWow3YM"
-    b"oU5psoyJ0f4yLpY5PkV8m7yfIH3FISXvr5DA47BJn9iJI5EOhKuqV0CP7IRjTM6odZjMCSItnF0g1ws6qJd2ECpZODNFGMLuJiXx"
-    b"KOVJ7gUt/x6GIZJgINzYQkMQXchP5lOegp+kcaiX8Q8TUsgJLojtPIoagX1ZaCeGlI7u2jXTJvHLSOIcaZsPHnqBG4bhn2mk5AOZ"
-    b"Jcn9DKS/5pA3ZwMIQ8zHRN2NT+hCF/k0x0/ls0R1I6F43E7tEGE4EXnOR6KdFEg0H+B03mHo6j4lUKIBU5WFoZcKj2w3N9HG0owr"
-    b"TKAh8UxBNogak5vca2xUst766CoLH0o+Mt22RtD6yHzeNhCtfABTp2wIyrgsFyPy6BNodPIvN6UK1f4UTNhC1uZqSZnJ0xzX+g4l"
-    b"ihuX+jVUlkNEPjnEknyr/MZPdhZ4RmwmWCQEt4gicgiACyKcV9sUcgiSg7NrDYJ2+zzbbVFGM12Z7doVJWxdUeoLwI7rJ7B5kYWD"
-    b"zp3Xcby4TZNFGTfRjTv8g0PYTUsqmnhtgO7U2zEB9OjgXx0a5rpmO2A/0GC9X9mYcRo1nmfpMcphyCHBdCyVDZgo+nhHpAocl0iF"
-    b"9L1BEg8gO6Q+rZOUwX4dTFKqZJFsxO5EOMuC17VYC0qZX9Ve5DvN4t21JajtNkt/xJOkC6YEoaBRfdrhMAzLGZMFCAgCA+NisEW0"
-    b"sD1gNqxbdI60Yb1u+BVHaETutmzDlrlYUvfYFffz2jXWbBJsZ3tGXo4DNtS+u3UbEhuyr6KRykajRPhenHctLFqAWVZ67kY2bgKW"
-    b"f07WTR3nqqWUY8OLirtfZVkieOo7QRpY4bLGaUZlw2Euqn4BNLjZe+W1A8I5tT8urGtOoxrHuIU2tqwjYbsf+pta2+MY0t/qHADw"
-    b"P9C5LI706+IpZD7FYfEEgVypmbSpeAzZUpU6URZ3yXjq6f/Qx/rb4lFxpF8CKT8++t/6emqVnduIgEuDvJaDlYepwU35KE458G4R"
-    b"uoUG0trD2lTwN/TLAJdrBFlknEt16JnKZIytpepQRq3gXmMjjMQka+oWfZdyrGatwK5dc3UNKKCsaXle0qwrqXWb169xapt0GB8q"
-    b"IXvVYfDbC0JzG7EthpkUzjwNWADodmLmI7BDO0tU9Y3ttiqFdM2qzBxNvhKhFw3DsNFn2wql2BGSGt61FZBMlWXyr2U2iXMR8iTx"
-    b"48j21MliO9ZyV0tjpUyanIm9yLQEGSbWCvNzC3KoPquGcRhijeLUrtiCxh9Vp/+Xa9AmNrk5HgoT4AOLB/t75fTc+k1mWIzypI7B"
-    b"AXGiR79sr954tgB6J4onPWCwSVXZ3IpszkSSCxKN1cJKMOVOzrkJDM8dhmavvMN+a3UKXai9FaysBS7+JrHqsZ+vdRjPf5MNXXXL"
-    b"u9mw0qagRtt5xJAQ8hY1Zi8r61L8JeplHRMKFfV+iYkp2S7oGlFBskR2EwyyuDFNYxsbuNRpSVmM5CarRfS9YRuM0Uz2/c0vo3Br"
-    b"NbjuVGEEtqDuKt1u3V8/uHpQb2N/ytU4lNksjfwba+w9cyFo8G7e2AoCdh0q8znTb4rHD9aX7wOBCyPC18UjvDD7d6bP9LPikT7G"
-    b"SHWoX+lTVvxbcajP9LdwvfZSH+vvi0dw4UINhWMGwQjvY+DniSkuzo0mTmuJBHnJyOXGywc//N/VA0dj5z+8Zj+8pBuEV/oYCX2r"
-    b"z1iTeSjUYP6A9dgDujmEg/eWwtnSzikym5H9v4FPwBP9HbQu3MB8xvQpg/sp/Uwf6+cY2U+YPiFmPm9deHRY8a/I7GfFE2ZY+rY4"
-    b"Kg6Lp8VjkM4rauK8KY5o7Uv9//ok9FjPcL2eUvxFn+nn+nt9rF/AxZg+1d+ZJkvIMCFBUepnxZEl/QWmBd/qM/g4o5MgJ09h4FS/"
-    b"Bn14jN9v9CmuKf4JxuFoxSOgBPs6RmfeMNSll7j/a+INysf2eswOJ/qNubUzdXktpJIh3qpcf9t2FucZjqLVYTGvuMDMyohzI5j/"
-    b"+OiPC61wEqcVXOWtSHnAAE/1ywtUyyVMih1ousU5306cy7sqdWgtSbFj5S5pkcNu9d0oXrnOK7YHBDwG1Yb2vPHO9R45zqy/S5fH"
-    b"+uGWoC7KTf8MGnWkX+hj/RqvdZ+S07H56inYQjv3dYx0c6tT7xm5XarGGwjI6z+lJMq3GVu/eiNjVQgepQhsWTgXBPU8r29zs+qe"
-    b"r7yBhd/VMEmTZElPVQQHVrrxF4lYd55VmdBKw3CSsmxqPOuYbU9iRS8CTElVR9tEaV5ZtKkubadNdX3vUrTjbAIp5UWVfp3rwGvD"
-    b"Y1vxL6jD3xFpDYtbuP8E4lpUkWvqgjEvREgiAIwCJigxZfg3dlFEqj4SQz5LoOXXENg6ZjiOjBagt/kbEXxAptzSlLLuMDeji/Yp"
-    b"j2Tyri6V8JdgU1WqV9VJExv5c/Ph1FT1kVoN1qJjQaUn9qY8jdxSr4ERL/2C9RW3lRpBYblpyqIOs/UPdB0xdd2qutFxtPD4Y56O"
-    b"hMP1hlU4NlFnrRS5UN2SJZfi7N9AueMmLjTdOo/epQC/zCGqahFrb8jRF9Tkld+jCn0RTJ25SHfzruIigtyuTsugTdi98FDOkZCl"
-    b"t9haRT6MdLt1UuuaYEL1xdtUCFdXlyuWeWzzbqIwzXnz0rEqkpzSftlDoaD1xiYSiVCi/ZgI3xzXQeGmqgFHFXqSDXhyj56KgrV/"
-    b"osTEUkKjHfb39z67G8Ir5nQUD/f9RR2GANltC/Dr77GyZcekmPA4zeHaIE4gSWJxytQ4zpni2yF777obThe8iKl3PM61e1TN8pqn"
-    b"LZmHYj/KdtNGaDD7UIB4KPap73sdH+RdoVGeqH8Q+87AQMmkPgItqvqI4nIEFkQPm30vhuhA72W4FLzDNk2jXkSxAsZsVQ/TlkQr"
-    b"nHNCTf2lTrDeau7CVY5JQxY/l2h2ZeAY5SVL2XsDv5BF++6w0Q5I3PEYe6pbqkN350b36gHW8Niz22Ae/MbaZJDJ6Sz3bPZdUdV8"
-    b"N4dah09o/ZqSjhYpKV20b25Z0kmkH0jJ98M4x9/2xVzTNpwHSghh2z9wAXCLwc1dNmTlbQBaQXn/UlP5+2PBtiFZF5JN+D4zNQGZ"
-    b"mH2OXSq828uFW8PFz+rqhQtydJDNyrudyhllMzkQ3QQusVpI/Jok9J+g2tNnXczx3+q3xRPzCBAqUlP+Pi+eQKn6Cuvi74uj4rEX"
-    b"sFWDKRcTnqp4ANig5v/4FwxqBSz7XxdPoexHfNgP+C93grBCCQpF5ysrLSe1I8xdCDutc7Q2B4KhGn5TPCke69fFUXkM8wC5bIc4"
-    b"cRbajXBHNksVm+OFEKAt75CaXdWld70p38EbyQ7D/6ZBa867723d+FLZYi96m7d59TtC2A1p9joNpSB9qLqbl0wR6ol2dUXc0Et7"
-    b"r9a++HMr2VLBKu45HKfSB9Mo/UfoRNiuA5SYp7blAoI8BsXUr4s/wCuUI2hYFIdQcTq9lg18O/e17cxgQ4S6K8VT/S18vITuxjPs"
-    b"lZwUhwj+Z32sv9MvzCz1p9jtO92ba+//AjK4qm99gdDFHp9ME0j/6s9RLpL8pcVSUVJz9DatxKEKabsIpnuuE+z4vNKn3gJYyvPM"
-    b"/zdx55e0k/vMu7l285fdGze6N2/UEdZrmnJm7vxdPfIh1i1TJqtO9NO+Vi+T5WWtj8t5wIvfrDefOf2UJzEUbNdX/gpQSwMEFAAA"
-    b"AAgAD4p1XQR9rLCfBgAASRMAAA4AAAB3ZWIvaW5kZXguaHRtbJ1Y2Y7cxBq+z1PUqWscEyIhLmy/S7X993Qx5YVydWfmbhZIQBMB"
-    b"ihAHoXNYRMQNF3QmadKZTDpSnuCvV5gnQbXY7eolIVzZ5fr35au/nPynqHN13ACZqFJktxLzIIJVBymVU2o+ACuyW4QkJShG8gmT"
-    b"LaiUTtU4+oSuNypWQkpnHO41tVSU5HWloFIpvccLNUkLmPEcIrv4gPCKK85E1OZMQHrHiVFcCcjwR1zhK32GC7zSp/qMvHlO8Gdc"
-    b"4VKf4hXBS4KvcaUfGIokdjyGW/DqkEgQKW3VsYB2AqAomUgYpzR2n27nbetUtbnkjSKtzFMas6a5/WlLSQFjkFkSu83sVhI715NR"
-    b"XRxbNrMGSXLB2jalqm5GTFqBhCSjqVJ11e2NJKsKSniR0kldAiUmxCl1RJQwyVkk2MiYi4/0qf5m7dXcSzRmNiyUGJVMHnr2CS8K"
-    b"qFKq5BRodvPwNIkNfWa5tsLoN52tsbPDr8a1LDstLTCZT5zh7j0y25TIWkC/vdNAT87z3sHQwqEFhCS8aqbK6vlsCvK4i1BnQBCh"
-    b"Qfpf25cFXlNSsiMB1YGapPTjDz+kpBEsh0ktCpApxZ8s6Ze4NDHwfPohXuOK6FO8NBLxGpdm8RJXeIlzs6SETVWd12UjQEFK6/F4"
-    b"7e3hqNjhGLE1mFJ8jCu80uf6lOArnNuEOqtxQbM4iQ9Hto92VEsjeckGMZiOSq5ohv/HOb7QZ7jcyFhschLWnQnkmAsFso1UfXAg"
-    b"gA7qNGK54iYvO8rQNKqsRdvz++9w1LCqACOXiRZoho9xiS/1Q32mT/TF0CTXKSBdb4HV1WnvhQ4s3EhvIHcYtzklLtTeV8uQ4a9d"
-    b"9ThvCqbAiWdjBdJUmiMMmH7G1T62EYxrCTv5+uR+h3PTmx8QXOkzglfmgSt9git8QfSpfmALba6/1me2nd/8gZf6AS70Cc7fvCS4"
-    b"dA3+Ba7wL1zigujPLfu1PseXuLSCLvEKly7tBJ8Zhfp8r6ttVI83Tfa1ECbZUEtoQUV99LcLI8Nf8YkxQp8aR/TDzoCNPPvkOthn"
-    b"vM+yYMf1VDll/t3bxFpeQI8RvACDmVvtbZFvhZf6woTmG/0VLl0wuoaZfGRT6BAyiScfbbZS6LTXV7FZJOt7hLdRCwJyBR6UmRBR"
-    b"ybjwljQS2taUuocqi2u7UPb7xx7GiIHtEFjmIR4a3Xk9rXxUjLZI1YqJHgrDrv5nrnhoZjModjrge3W/Bz/c7z0wsPoMn9g6vHqH"
-    b"+U7jO+yf3M3wzy53STy52+8UfNZHYVQfwboI11+yJC74LGAJyyYa13VnTj2Vee+nJytqtbbNbqxJXbHRDP+Lc3yqT/Q5/oVzc5AE"
-    b"Kbw5+b13rjcmiW0R+8UGvklop0IFkCagGB13O5FFELrLLc8aGfDsCUISy2zzniWTO10vD8TuKMMkntwJA6N4yasDF7nu3QPrtrfW"
-    b"hGaoqgC1rjTBZ5DSphZcQRDO56aGbPya3b6UdWHybsvAvQYo8AsuLDRev+UEeFufFEyxyAhOaVsyM4Luam38Da/xlb7AF5vV+48k"
-    b"CzjiOdvXdfaQGQ4U/0pHCyWrFM93K/GjmSOxHGu91/rCaNfn23rD3goWGwWtpqqW3Phoy6VfhZCtT+z8tHBH9nOc42t/fKzwcjtp"
-    b"HX47Knyiz+1gsxjkegjqA8SAI2aGsS14GB5Fm5XGFZS+0tzrfmhp2AGvmBuODP1wveXE2/B5OGVZQRJmfoQz0XnWp2SNTA07cH65"
-    b"Fnwf6RUcmQHxO5zbyelLcxfaAOMhfgWx2kYwM7vtSLDJ5rUZdPRJADB7wMxIiaBs1HE3dAy+DKI4RCa7uf/OcPO/r8Jrg6+kR/oC"
-    b"n9jhanu836ijxmDUM1yYbTu84ZUtwYUf1HCBT133mMPQiLQgZChuD6AsLCAmFc9FP9YIUGbwdNOPf98qnkGsHE2k6lq4C+l7VhgZ"
-    b"sfzQz67mLbu5/y3BH4Mk7QGf8LzMIwljJ6hbbNzT3scqMyOsp4U9GHnzw32Cj1zf98PHOxHL5n0Q36idjj6F3J73W7ARRtn8naB7"
-    b"Y8BmTDFJfK261TCR/ad33mg79VkwuUBle2toufvkISk4IN0o5EeVIc+oPuoZwrDY/yYlDIntJSEz/0ZK2B/OgV6Y8QKq3Oduvdpx"
-    b"8u7gilTdmOnkboaPzW0Hn5pzwfx7ILjE55ujyd0wPvygYsJjdbfY66mbStaKLQiG88Z+L/tQFh6fhh82Dxff4DvwM4nNvcf8HXK/"
-    b"hZLY/Tj7G1BLAwQUAAAACAAPinVdzbhfYq0KAABCKQAADgAAAHdlYi9zdHlsZXMuY3NzrVpJj+u4Eb77VzAwgm5PLEeLVxkJcs05"
-    b"yGkwB0oq2pwniQJFLz2N/u8BF0mURNnulzm8hzYtk7V+9VVRMWdMoM8ZQinLGffq9AwFxCinp7M4zhDyvAqfIEZzsiUbctBLNc0g"
-    b"wVyuRiQge71Kyx8xmodBkEQbvVJcBGQxmm/DTbbb6rWclnI72EMERC/hNIVSyOf8CGeBvehlmMtd17vQxzv9jaDqYQDYk0QvpZjL"
-    b"cwhROxJWCo/gguYfMXr7D5wYoP/++22J6o9aQOFd6BLVuKy9GjhVv1DKx+iK+bvSYyEXE5z+OHF2KbPmG2mKxXH2NftliX6J4wQI"
-    b"46D+xEQAR58oYXevpn/Q8hSjhPEMuJew+xF9zRKWfaBPVGB+omWM/CMqaOndaCbOMYpCv1JP/XqmWQblb+gTZbSucvwRo5KVgP5C"
-    b"i4pxgUuhNrsIwcolomV1EehTaRwjWp6BU+sB9InSC6+lahWjpQDefRdntMZJDpn1UAYEX3JxRKzCKRUfMVqtd9ZPCEsvtXelNU1y"
-    b"MKf3F9EnYhehfRxWd1SznGbGetqji2PzhMcIqUHEKNK6rwSrEsxt1U+cZkf1vyegqHIswEtZfinKOkbBfl/dpRULfH/3l2gnjbhA"
-    b"+CLYEeGcnkqPCijqGMlzpe4nXMUoXMvjKpxlykvBrrqjSJl/7HAZV4tj50khWBGjYKCYVGahNEg4LjNbAVoqTUkO9yMyziZUeCkr"
-    b"BUhfTssZaJnU0SpebPEEx2VdYa72aHXxj45I1ulwA5nRMdptfbNS0z+kkwJ5Sg5CAPdq6Xa5kbfaGZ8ojbwC8x9jv1Q5TmEoexPR"
-    b"yspnc6r+ZMzIcUYv0n+B2+htnBhdbmcq4NjPancm24pFWjFp/UaKQGlUA+bp2dZGe+eBJ9RWzS7rbS9+1tW9/RdYatphMs9ItoP0"
-    b"BQvMCSYHklqCmvy6UXGmMqHNFj0/txbr1GuRIYe70txCG7/1UuD7f+3FWJu8/hHhqgLMcZmCxqAHETgVddoVwcYEk5bNo6mCporV"
-    b"VFBWxohDjgW9QidXL3r0J6mJV5+5KjO+ZebVvjP0LtiG+2xk6I1Usy9Ah9mdHDipWX6RwWbyM0Zvb61QW1um0BXQI2824ihjEcaL"
-    b"GHEmsID39T6D0+KIuN7OM5GjAcZTu3/NfiTZGNxtwyrk7BlfldyFMwghyPaQjG0zyhNdjKyACZU8Au7CU1nS5cfXbFVxWmAua5vO"
-    b"oBpyEqNacBDp+Rv5bSNdX0KFRR3IoWCv4sGygw4QG+e2e9+WLj6zqy7QE+IooqEzSLDKw6mMCPTpxGwlsAJLlRk3jitLPhmNJrFH"
-    b"PujVC5eWjkSarEqjQOgbIPQH2mgbxCUT723xXyyR9cSvmFPswb3CZQbZP94Ev8DbbyPQmae7ZAPgEk1ys86zEwYmNBfA6zEEqxSX"
-    b"5oyRNqqGX0kktM+dGN2V8rUp5fqvcB3+OVW9kTfHCeST1X26fuwms3TkQuu0BsELfG/yMNioZG0V3lR3jUrfi7Tt0CwmAx3B9zVb"
-    b"5fiDaUFo2UJEivP0PfD97HpGHtoH1X1xfJG2hYpxGdoWSXctURRdbwuLygWEm2qmOw2J0o3S4bZ18ARrMz+yFDd1ZNLDzTHn0Kbo"
-    b"Ko3t3DKeOrgpU+PAdrPI2ixsYAEdHkdDS9T8PlGTWaC2L/HV4+zWYZMu4i+zGXV+lzMqXXpUszNTr8ZPFv9BdO2HtSIH0lGEeUSi"
-    b"7WY7ZGar0AHoEq5Izm4GEnD5cTsDB9sKGtOWqPm8opIL5pAK1dj0ijHswSf7Z+Dk3mjsGvNoyi6laP3sSV1j04LY+gSPnX6VwFsK"
-    b"r7wUwGkaI4GTS465XKjtoPKI6tcfelsTJYG5MB5XHmkDUWbfobrLOttFQSQXrNIrWNXnDmGGJeI/RTEVpQPfrjdKhUxJboJWYWLz"
-    b"iPrgomwPyIMmtj7y9a+N/ZXcDd3kUF9yIetMn/w+qwhP4cJs7J0BZz1o2hhUQoEFyy9UGEFFDiarX05k5dbfL7Wg5KMhJzFStMRL"
-    b"QNwASrn5OeiPHezmb+1GMrXzOEGVoAUtT7bOEojV8/1c25ANjHm4RuwGCkJ/k60jR6I4CVaf3ez8sScqOcpwBWij/b6J8lHdfQQ1"
-    b"BcvAQVaUD5QBnS5yEcfvlWkrbU0+9qt/NG4eE4JJZgndjoGegLcKjB6tmK5SrvZhhABODw7E0myz4lDXfbL5E6zSic/iIhinWFK2"
-    b"DumaFB2aLiUJId9J2WbzAWfwtelGFnHa8ms2hzsuqhxeZsMKWL5mK/O7n7TXdLOl86EXC5oeuLiIEcLZXc1hkzWjDJUbAwq5MyPP"
-    b"VYFprrLHMWFyjAgmaKUcMY0YpDVI65Glfstgg7VtkidB8BqDHjMh2wj77dAIblsSTHYyPO0nX8mfOfEBk+SFHzbjbIWh1vDDNR2h"
-    b"pZrb+oroaERtxn5PRnpfsxW+YuGa8v6/08RxTsMBAql7U2/WWYgPMAQLOShw9WGdR0px9tIzzbP3qPxbuECdCv3jfBIC6ZW3dBM8"
-    b"2GtyJ7KHNEu7nbZ4vQsGTkSrGkplABdreEYLplnFKCCbg5aot3ZJfodULJHKbRlMVwpSkKaSxkhfZZgM6JYhz2lV0/pBkRge3RDw"
-    b"6WGHmfZYvxS0kLH8Ggl/RRKtsG3qJGfpj36Jjl6YTB20rAO7Pdp1/Z2KsoKiEh/at88IkV31VV+tK+NIgQEX3OrRGj7REps52Z8W"
-    b"fzqPnVK7UNtVlThgHTR92t9+4ykL9Ucr6+30uY21Al9Se415tuE2D6ajxhl64v0NxFvve3cOvRZO4+5E5f5p9mRaggb+eqZSHOfx"
-    b"kF9fJLWmkrzBb8Gkt1k12Y/oYJMzJ9WS9D10MGPpgRH6zVea46J6l6GxRNH1tkRyBrhA64ZrmF5HMJY7GNezqHzebK0ylnocyCj4"
-    b"XmucH7UhNb7Cn0mZ5eUeTnvXevqWp7P/P7XjLTG1fWWQGPtGGzX6G/eQ/gaKEXAEGytE5CDCf6H/MnsXIPD3Xfba2NUEUcf4dEf7"
-    b"Eg18VfRBLWv5R+C+te2ypuUI3chDMyBToOQ7B81oelTuRsVpIJUpk47xlQ1oaiJi/9a8zdCrmxUHZYMHJhldCg7iYxd2vlAiN+9F"
-    b"rOBKMyjTTlbtJE0+u8IQPrqFhXW2J3iEm6pfM2vaANHUmwvtEHMd7jaDSdKchJCY7ruRVirxYsy6uz01NQ6HNlCT5VEQW5hqPywF"
-    b"GGFs86zOQf+By5ylv6anErsQ1K1Fe/+rfma349LS6tuBT5SQFm9PDochud9le9ld2qr5Y7IlvfQ1M+8vDOh6CuRg+fQQBtvtSBKT"
-    b"NP8qIKMYvdsF6aDeN5EvT3Wvrky9qyIr+KA9NXnW3nF1oa/vlbqLc4S6W5ipA7bb7oBwr29Vtu5bFYSsK7jmTB35TQV2KmxesHlN"
-    b"YcKHBVrr2I0ulSDt2xhqHznRR6Hp8fVeMQrQ35Gn+iiE9I34qGDZBhoSaX3M+B6pS61nMTxdY+xG9Nm0oDdb9gdyncOl9SHqPowG"
-    b"/pbKo5uggcFlRIyuyg2YIN3NJezeHz0ZalNbRzRXHC4ReDtid+s3NSm3GLx5zlD2adeqZ+Twudl0Of6mc/Nr+8hDl2jEg+zIaalo"
-    b"ry41U4Kv2f8AUEsDBBQAAAAIAA+KdV0ZCSfhaAEAALwCAAANAAAAc3RhcnRfZGVtby5weXWRzU7DMBCE736KvdkRUVq4IFXKqeWA"
-    b"EAJROFsu2TSWHNtabwhVxbujJC0tVOzNo5nP+1NTaIEbQlNZvwXbxkAMr6MgDq8eNxsKfUISoh78rbEuoaH3pqgMm2Nqdff4pJdP"
-    b"L89v6xxcMJV2yIyULlLot9bjMbcexbtRu7AmpA+ko/XRWLceFSFEhfXg9CpbCACAA7X8BVTnjaizFrNsDPWWmzOsUvL65raYF/Pi"
-    b"WuYwz/IDNodX6jADk2BqafpzqI4clFDLhjkuZrOf/GI/OQ8z6GGCr5n8yUWynlUtV9iGBew7cl8yh9p1qSnHz/445QNiBG5sgt76"
-    b"KvQQIvoCnglTgiWTu1oCB0gcYvEPabqsYkNb5PJ02WJA5WBom0rVkcuzHCqDbfAToEhsiNUJxLQ7bWCo81l1HQiHbZ78+PmOkeEB"
-    b"d5tgqLr3jERd5N+QaFISQtgatPamRa2hLEFqPdxZazm5p6OLb1BLAQIUABQAAAAIAA+KdV2YAGuKAAwAAMAoAAAWAAAAAAAAAAAA"
-    b"AACAAQAAAABmaXh0dXJlcy9sZXR0ZXJzLmpzb25sUEsBAhQAFAAAAAgAD4p1XR3zFibaAAAACAUAABQAAAAAAAAAAAAAAIABNAwA"
-    b"AGZpeHR1cmVzL3FyZWxzLmpzb25sUEsBAhQAFAAAAAgAD4p1XRWybli1AwAAKw4AABYAAAAAAAAAAAAAAIABQA0AAGZpeHR1cmVz"
-    b"L3F1ZXJpZXMuanNvbmxQSwECFAAUAAAACAAPinVd9+F1dDUAAAAzAAAAFgAAAAAAAAAAAAAAgAEpEQAAbWFpbHNlYXJjaC9fX2lu"
-    b"aXRfXy5weVBLAQIUABQAAAAIAA+KdV0ov7ecyQsAACQkAAASAAAAAAAAAAAAAACAAZIRAABtYWlsc2VhcmNoL2RhdGEucHlQSwEC"
-    b"FAAUAAAACAAPinVdcIA78L0YAAA4RwAAFAAAAAAAAAAAAAAAgAGLHQAAbWFpbHNlYXJjaC9lbmdpbmUucHlQSwECFAAUAAAACAAP"
-    b"inVdIOh3ozMKAAAoHgAAFgAAAAAAAAAAAAAAgAF6NgAAbWFpbHNlYXJjaC9ldmFsdWF0ZS5weVBLAQIUABQAAAAIAA+KdV0ex77R"
-    b"cQQAAN0KAAAWAAAAAAAAAAAAAACAAeFAAABtYWlsc2VhcmNoL2xvYWR0ZXN0LnB5UEsBAhQAFAAAAAgAD4p1XRUnEUKLCgAAuBsA"
-    b"ABYAAAAAAAAAAAAAAIABhkUAAG1haWxzZWFyY2gvc2VtYW50aWMucHlQSwECFAAUAAAACAAPinVdu1nOiVsKAAC+GgAAFAAAAAAA"
-    b"AAAAAAAAgAFFUAAAbWFpbHNlYXJjaC9zZXJ2ZXIucHlQSwECFAAUAAAACAAPinVdsBPmz3QCAACLBgAAFgAAAAAAAAAAAAAAgAHS"
-    b"WgAAbWFpbHNlYXJjaC90ZW1wb3JhbC5weVBLAQIUABQAAAAIAA+KdV1qfOagqxEAAPY1AAAKAAAAAAAAAAAAAACAAXpdAAB3ZWIv"
-    b"YXBwLmpzUEsBAhQAFAAAAAgAD4p1XQR9rLCfBgAASRMAAA4AAAAAAAAAAAAAAIABTW8AAHdlYi9pbmRleC5odG1sUEsBAhQAFAAA"
-    b"AAgAD4p1Xc24X2KtCgAAQikAAA4AAAAAAAAAAAAAAIABGHYAAHdlYi9zdHlsZXMuY3NzUEsBAhQAFAAAAAgAD4p1XRkJJ+FoAQAA"
-    b"vAIAAA0AAAAAAAAAAAAAAIAB8YAAAHN0YXJ0X2RlbW8ucHlQSwUGAAAAAA8ADwDNAwAAhIIAAAAA"
+
+REVISION = '761b726'
+MODEL_URL = f'https://huggingface.co/Xenova/multilingual-e5-small/resolve/{REVISION}'
+FILES = {
+    'tokenizer.json': 'tokenizer.json',
+    'model_quantized.onnx': 'onnx/model_quantized.onnx',
+}
+MODEL_HASH = 'f80102d3f2a1229f387d3c81909990d8945513e347b0eab049f7de3c6f98c193'
+
+
+def digest_file(path):
+    with path.open('rb') as handle:
+        return hashlib.file_digest(handle, 'sha256').hexdigest()
+
+
+def download(folder):
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, remote in FILES.items():
+        target = folder / name
+        if target.is_file() and (name != 'model_quantized.onnx' or digest_file(target) == MODEL_HASH):
+            continue
+        print(f'Downloading {name}', flush=True)
+        temp_path = None
+        try:
+            with urllib.request.urlopen(f'{MODEL_URL}/{remote}', timeout=45) as response:
+                with tempfile.NamedTemporaryFile(dir=folder, suffix='.part', delete=False) as output:
+                    temp_path = Path(output.name)
+                    shutil.copyfileobj(response, output)
+            if name == 'model_quantized.onnx' and digest_file(temp_path) != MODEL_HASH:
+                raise ValueError('Unexpected SHA-256 for the ONNX model')
+            temp_path.replace(target)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+
+
+class E5Encoder:
+    def __init__(self, folder):
+        try:
+            import numpy as np
+            import onnxruntime as ort
+            from tokenizers import Tokenizer
+        except ImportError as exc:
+            raise ValueError('Install requirements-semantic.txt to enable E5') from exc
+
+        paths = [folder / name for name in FILES]
+        if not all(path.is_file() for path in paths):
+            raise ValueError(f'Model not found in {folder}. Run python -m mailsearch.semantic download')
+        self.np = np
+        self.tokenizer = Tokenizer.from_file(str(paths[0]))
+        self.tokenizer.enable_truncation(max_length=256)
+        self.tokenizer.enable_padding(pad_id=self.tokenizer.token_to_id('<pad>'), pad_token='<pad>')
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = min(4, os.cpu_count() or 1)
+        opts.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(str(paths[1]), sess_options=opts, providers=['CPUExecutionProvider'])
+        self.inputs = {entry.name: np.int32 if entry.type == 'tensor(int32)' else np.int64 for entry in self.session.get_inputs()}
+        self.cache_key = ('E5 quantized masked mean 256 v1', *(digest_file(path) for path in paths))
+
+    def encode(self, texts, prefix):
+        pieces = self.tokenizer.encode_batch([prefix + text for text in texts])
+        arrays = {'input_ids': [value.ids for value in pieces],
+                  'attention_mask': [value.attention_mask for value in pieces],
+                  'token_type_ids': [value.type_ids for value in pieces]}
+        inputs = {name: self.np.array(arrays[name], dtype=dtype) for name, dtype in self.inputs.items()}
+        output = self.session.run(None, inputs)[0]
+        mask = self.np.asarray(arrays['attention_mask'], dtype=self.np.float32)[..., None]
+        vectors = (output * mask).sum(axis=1) / mask.sum(axis=1).clip(1)
+        norms = self.np.linalg.norm(vectors, axis=1, keepdims=True).clip(1e-8)
+        return (vectors / norms).astype(self.np.float32, copy=False)
+
+
+class DenseIndex:
+    def __init__(self, letters, passages, encoder, cache):
+        import numpy as np
+
+        self.np = np
+        self.encoder = encoder
+        self.starts = np.cumsum([0] + [len(values) for values in passages[:-1]])
+        passages_by_letter = [[f'{letter.subject.strip()}\n{value}'.strip() or '(пустое письмо)' for value in values]
+                              for letter, values in zip(letters, passages)]
+        texts = [value for values in passages_by_letter for value in values]
+        fingerprint = hashlib.sha256(json.dumps([encoder.cache_key, texts], ensure_ascii=False).encode()).hexdigest()
+        path = cache / f'vectors-{fingerprint}.npy' if cache is not None else None
+        self.vectors = None
+        if path is not None and path.is_file():
+            try:
+                vectors = np.load(path, allow_pickle=False)
+                if vectors.ndim == 2 and len(vectors) == len(texts) and vectors.dtype == np.float32:
+                    self.vectors = vectors
+            except (OSError, ValueError, EOFError):
+                pass
+        if self.vectors is None:
+            print(f'Encoding {len(texts):,} passages once; the index is reused on the next launch.', flush=True)
+            batches = []
+            for start in range(0, len(texts), 32):
+                batches.append(encoder.encode(texts[start:start + 32], 'passage: '))
+                if start and start % 1024 == 0:
+                    print(f'  {start:,} / {len(texts):,}', flush=True)
+            self.vectors = np.ascontiguousarray(np.concatenate(batches), dtype=np.float32)
+            if path is not None:
+                self._write_cache(path)
+
+    def _write_cache(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, suffix='.part', delete=False) as handle:
+                temp_path = Path(handle.name)
+                self.np.save(handle, self.vectors, allow_pickle=False)
+            temp_path.replace(path)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+
+    def rank(self, query, scope, limit):
+        np = self.np
+        vector = self.encoder.encode([query], 'query: ')[0]
+        similarities = self.vectors @ vector
+        best = np.maximum.reduceat(similarities, self.starts)
+        scope_ids = np.arange(len(best)) if scope is None else np.fromiter(sorted(scope), dtype=int)
+        order = scope_ids[np.argsort(-best[scope_ids], kind='stable')[:limit]].tolist()
+        evidence = {}
+        for i in order:
+            start = self.starts[i]
+            end = self.starts[i + 1] if i + 1 < len(self.starts) else len(similarities)
+            evidence[i] = int(np.argmax(similarities[start:end]))
+        return order, evidence
+
+
+def add_model_args(parser):
+    parser.add_argument('--model-dir', type=Path, metavar='PATH', help='Enable local E5 from this directory')
+    parser.add_argument('--cache-dir', type=Path, default=Path('.cache'))
+
+
+# engine.py
+
+
+import heapq
+import math
+import re
+import unicodedata
+from collections import Counter, OrderedDict, defaultdict
+from dataclasses import dataclass
+from functools import lru_cache
+from threading import RLock
+
+
+KEYBOARD_TO_RUSSIAN = str.maketrans("qwertyuiop[]asdfghjkl;'zxcvbnm,.", 'йцукенгшщзхъфывапролджэячсмитьбю')
+LOOKALIKE_TO_RUSSIAN = str.maketrans('acekopxy', 'асекорху')
+RUSSIAN_ALPHABET = 'абвгдежзийклмнопрстуфхцчшщъыьэюя'
+ROMAN = str.maketrans(dict(zip(RUSSIAN_ALPHABET, (
+    'a','b','v','g','d','e','zh','z','i','y','k','l','m','n','o','p','r',
+    's','t','u','f','kh','ts','ch','sh','shch','','y','','e','yu','ya'
+), strict=True)))
+
+
+def roman_key(word):
+    return word.replace('kh', 'h').replace('yi', 'yy')
+
+
+def russian_correction(word, vocabulary):
+    if not any('а' <= char <= 'я' for char in word) or not word.isalpha() or len(word) > 32:
+        return None
+    mapped = word.translate(LOOKALIKE_TO_RUSSIAN)
+    if any(char not in RUSSIAN_ALPHABET for char in mapped):
+        return None
+    if mapped != word:
+        candidate = stem(mapped)
+        return candidate if candidate in vocabulary else None
+    if len(word) < 5:
+        return None
+    candidates = set()
+    for i, char in enumerate(word):
+        left, right = word[:i], word[i + 1:]
+        candidates.add(left + right)
+        if right:
+            candidates.add(left + right[0] + char + right[1:])
+        for letter in RUSSIAN_ALPHABET:
+            candidates.add(left + letter + right)
+            candidates.add(left + letter + char + right)
+    candidates.update(word + letter for letter in RUSSIAN_ALPHABET)
+    matches = {key for candidate in candidates if (key := stem(candidate)) in vocabulary}
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+WORD = re.compile(r'[^\W_]+', re.UNICODE)
+ANCHOR = re.compile(
+    r'(?<![\w@])(?:[\w.+%-]+@[\w.-]+\.[a-zа-я]{2,}|[a-zа-я]{1,12}[-_]?\d{2,}[a-zа-я\d-]*|'
+    r'\d{2,}[-_]?[a-zа-я]{1,12}[a-zа-я\d-]*|\d{5,})(?!\w)', re.I,
 )
+EXPLICIT_NUMBER = re.compile(r'(?:№\s*|\b(?:номер|заказ)\s*#?\s*)(\d{3,})\b', re.I)
+SUFFIX = re.compile(r'(?:иями|ями|ами|ого|ему|ому|ыми|ими|оев|ой|ей|ия|ию|ии|ие|ые|ых|ую|ое|ая|яя|ам|ям|ах|ях|ов|ев|ом|ем|ть|а|я|ы|и|у|ю|е|о)$')
+STOP = set('и в во на по за с со из о об к у до для от а но не что это как где когда ли или про там был было были есть письме писали письмо мне меня меняю мой моё мои моего который которая найти покажи все вот по the an of to for is'.split())
+
+# Cross-reference common language in transactional mail. An event also matches
+# across inflections via the stems. This is a transparent offline retrieval mode.
+EVENTS = {
+    'air_departure': 'вылет отправление авиа авиакомпания самолёт самолет борт рейс улетит авиарейс аэропорт',
+    'schedule_change': 'перенос перенесено перенесли смещение изменилось изменение задержка отложен позже опаздывает сдвиг передвинули',
+    'refund': 'возврат возмещение компенсируют компенсация вернут вернули возвращены reimbursement refund',
+    'payment': 'оплата платёж платеж списание списали оплачено транзакция перечисление списано',
+    'delivery': 'доставка курьер посылка отправление привезут пункт выдача доставят привезли получение',
+    'pickup': 'постамат пвз самовывоз выдача забирать забрать ячейка',
+    'access': 'аккаунт доступ профиль безопасность',
+    'login': 'войти вход вошли авторизация авторизоваться логин сеанс',
+    'credential': 'пароль пароля логин учётка',
+    'reset': 'сброс восстановление восстановить сбросить забытый восстановлен',
+    'meeting': 'встреча звонок созвон совещание конференция консультация интервью собеседование',
+    'receipt': 'чек квитанция счёт счет инвойс invoice receipt кассовый фискальный подтверждение',
+    'subscription': 'подписка абонемент тариф автопродление продление подписку списывают ежемесячный',
+    'ticket': 'билет билеты бронирование бронь заказ поездка путешествие',
+    'application': 'заявка заявление обращение запрос регистрация форма рассмотрение',
+    'approval': 'одобрение одобрили принята прошёл подтверждена подтвердили согласовали принято',
+    'survey': 'опрос анкетирование анкета отзыв обратная связь оценка мнение',
+    'attachment': 'файл документ акт pdf',
+    'attached': 'вложение приложен приложили прикрепили прикреплён вложен прилагается',
+    'deadline': 'срок истекает дедлайн крайний осталось последний окончание',
+    'cancellation': 'отмена отменили аннулирование аннулирован отказ отменён',
+    'security_code': 'код otp кодом верификация одноразовый подтверждение 2fa',
+    'money': 'деньги средства сумма кошелёк карта карточка рублей рубли',
+}
+CONTEXT_EVENTS = {'access', 'attachment', 'credential', 'money', 'ticket'}
+HYPHENS = str.maketrans({char: '-' for char in '‐‑‒–—―−'})
+
+
+def normalized(value):
+    return unicodedata.normalize('NFKC', value).casefold().replace('ё', 'е')
+
+
+@lru_cache(maxsize=65536)
+def stem(word):
+    if len(word) >= 5 and 'а' <= word[0] <= 'я' and word.isalpha():
+        shortened = SUFFIX.sub('', word)
+        if len(shortened) >= 3:
+            return shortened
+    return word
+
+
+def words(text):
+    return WORD.findall(normalized(text))
+
+
+def terms(text):
+    return [stem(word) for word in words(text) if word not in STOP and len(word) > 1]
+
+
+def anchor_key(value):
+    value = normalized(value)
+    return value if '@' in value else re.sub(r'[\s_-]+', '', value)
+
+
+def anchors(text):
+    # Date, time, and ordinary quantities are not automatic order numbers.
+    value = unicodedata.normalize('NFKC', text).translate(HYPHENS)
+    numbered = {anchor_key(match[1]) for match in EXPLICIT_NUMBER.finditer(text)}
+    return numbered | {anchor_key(match[0]) for match in ANCHOR.finditer(value)}
+
+
+INTENTS = defaultdict(set)
+for event, variants in EVENTS.items():
+    for key in terms(variants):
+        INTENTS[key].add(event)
+    # Short masculine nouns do not pass the normal five-character stem gate
+    # (e.g. "чек" and "чеки"). Index their regular short case forms as aliases.
+    for word in words(variants):
+        if len(word) == 3 and all(c in RUSSIAN_ALPHABET for c in word) and word[-1] in 'бвгджзклмнпрстфхцчшщ':
+            for ending in ('а', 'у', 'е', 'и', 'ы', 'ов', 'ам', 'ами', 'ах'):
+                INTENTS[stem(word + ending)].add(event)
+
+
+def events(keys):
+    return set().union(*(INTENTS.get(key, set()) for key in keys))
+
+
+def split_passages(text, size=64, overlap=16):
+    if not text:
+        return ['']
+    passages = []
+    for block in re.split(r'\n{2,}', text):
+        block = ' '.join(block.split())
+        if not block:
+            continue
+        parts = list(re.finditer(r'\S+', block))
+        for start in range(0, len(parts), size - overlap):
+            end = min(start + size, len(parts))
+            passages.append(block[parts[start].start():parts[end - 1].end()])
+            if end == len(parts):
+                break
+    return passages or ['']
+
+
+def clipped_evidence(passage, query_terms, query_anchors):
+    limit = 330
+    if len(passage) <= limit:
+        return passage
+    candidates = list(re.finditer(r'(?<=[.!?])\s+|[,;]\s+', passage))
+    starts = [0, *(match.end() for match in candidates)]
+    for match in re.finditer(r'\S+', passage):
+        token = match[0].strip('.,!?:;()[]«»')
+        if anchors(token) & query_anchors or set(terms(token)) & query_terms:
+            starts.append(max(0, passage.rfind(' ', 0, max(0, match.start() - 100)) + 1))
+    def excerpt(start):
+        end = start + limit
+        if end >= len(passage):
+            return passage[start:]
+        boundary = passage.rfind(' ', start, end + 1)
+        return passage[start:boundary if boundary > start else end]
+
+    excerpts = (excerpt(start) for start in set(starts) if start < len(passage) - 55 or start == 0)
+    ranked = max(excerpts, key=lambda value: (len(anchors(value) & query_anchors), len(set(terms(value)) & query_terms), len(value), -passage.find(value)), default=passage[:limit])
+    return ('…' if not passage.startswith(ranked) else '') + ranked + ('…' if not passage.endswith(ranked) else '')
+
+
+@dataclass(frozen=True, slots=True)
+class Hit:
+    index: int
+    score: float
+    evidence: str
+    signals: tuple[str, ...]
+
+
+class SearchEngine:
+    def __init__(self, letters, encoder=None, cache=None):
+        self.letters = tuple(letters)
+        self.by_id = {letter.doc_id: i for i, letter in enumerate(letters)}
+        self.dates = tuple(letter.day for letter in letters)
+        self.boxes = defaultdict(list)
+        for i, letter in enumerate(letters):
+            self.boxes[letter.mailbox_id].append(i)
+        self.inbox = tuple(sorted(range(len(letters)), key=lambda i: (self.dates[i], letters[i].date, -i), reverse=True))
+        self.passages = [split_passages(letter.body) for letter in letters]
+        self.search_terms = defaultdict(list)
+        self.doc_anchors = []
+        self.anchor_index = defaultdict(set)
+        self.doc_events = []
+        self.event_index = defaultdict(set)
+
+        rows = []
+        self.roman_terms = {}
+        total_lengths = [0, 0, 0]
+        for i, letter in enumerate(letters):
+            texts = (letter.subject, letter.sender, letter.body)
+            fields = []
+            for text in texts:
+                counts = Counter()
+                for word in words(text):
+                    if word in STOP or len(word) < 2:
+                        continue
+                    key = stem(word)
+                    counts[key] += 1
+                    if len(word) >= 3 and all(char in RUSSIAN_ALPHABET for char in word):
+                        alias = roman_key(word.translate(ROMAN))
+                        if self.roman_terms.setdefault(alias, key) != key:
+                            self.roman_terms[alias] = None
+                fields.append(counts)
+            lengths = [sum(field.values()) for field in fields]
+            total_lengths = [total + length for total, length in zip(total_lengths, lengths)]
+            rows.append((fields, lengths))
+            self.doc_anchors.append(anchors('\n'.join(texts)))
+            for anchor in self.doc_anchors[-1]:
+                self.anchor_index[anchor].add(i)
+            doc_events = events(set().union(*fields))
+            self.doc_events.append(doc_events)
+            for event in doc_events:
+                self.event_index[event].add(i)
+
+        averages = [max(1, length / max(1, len(letters))) for length in total_lengths]
+        weights = (2.6, 1.35, 1.0)
+        for i, (fields, lengths) in enumerate(rows):
+            effective = defaultdict(float)
+            for field, length, average, weight in zip(fields, lengths, averages, weights):
+                scale = weight / (0.35 + 0.65 * length / average)
+                for term, count in field.items():
+                    effective[term] += scale * count
+            for term, tf in effective.items():
+                self.search_terms[term].append((i, 2.2 * tf / (1.2 + tf)))
+        self.idf = {term: math.log1p((len(letters) - len(postings) + 0.5) / (len(postings) + 0.5)) for term, postings in self.search_terms.items()}
+        self.snapshots = OrderedDict()
+        self.snapshot_lock = RLock()
+        self.dense = None
+        if encoder is not None:
+
+            self.dense = DenseIndex(letters, self.passages, encoder, cache)
+
+    def eligible(self, mailbox='', after='', before='', as_of=''):
+        if not mailbox and not after and not before and not as_of:
+            return None
+        scope = self.boxes.get(mailbox, []) if mailbox else range(len(self.letters))
+        return {i for i in scope if (not after or self.dates[i] >= after)
+                and (not before or self.dates[i] and self.dates[i] <= before)
+                and (not as_of or not self.dates[i] or self.dates[i] <= as_of)}
+
+    def browse(self, mailbox='', after='', before='', offset=0, limit=25, as_of=''):
+        scope = self.eligible(mailbox, after, before, as_of)
+        order = self.inbox if scope is None else [i for i in self.inbox if i in scope]
+        return [self.letters[i] for i in order[offset:offset + limit]], len(order)
+
+    def _visible_index(self, key, scope):
+        # Statistics, spelling vocabulary and topic frequencies must only see
+        # messages available in the selected mailbox and time window.
+        with self.snapshot_lock:
+            if key in self.snapshots:
+                self.snapshots.move_to_end(key)
+                return self.snapshots[key]
+            indices = sorted(scope)
+            view = SearchEngine([self.letters[i] for i in indices])
+            self.snapshots[key] = (indices, view)
+            while len(self.snapshots) > 1 and (len(self.snapshots) > 16 or
+                    sum(len(v[0]) for v in self.snapshots.values()) > 8000):
+                self.snapshots.popitem(last=False)
+            return indices, view
+
+    def search(self, query, mode='smart', limit=25, mailbox='', after='', before='', as_of=''):
+        if not query.strip() or limit <= 0:
+            return []
+        period = received_period(query, as_of) if mode == 'smart' else None
+        if period:
+            start, end, query = period
+            after = max(after, start)
+            before = min(before, end) if before else end
+        scope = self.eligible(mailbox, after, before, as_of)
+        if scope is not None and not scope:
+            return []
+        engine, indices = self, None
+        if mode == 'smart' and self.dense is None and scope is not None and len(scope) < len(self.letters):
+            indices, engine = self._visible_index((mailbox, after, before, as_of), scope)
+            scope = None
+        hits = engine._rank(query, mode, limit, scope, as_of, period)
+        if indices is None:
+            return hits
+        return [Hit(indices[h.index], h.score, h.evidence, h.signals) for h in hits]
+
+    def _rank(self, query, mode, limit, scope, as_of, period):
+        if mode == 'smart' and query.isascii() and not any(char.isdigit() for char in query) and '@' not in query:
+            original = set(terms(query))
+            if original.isdisjoint(self.search_terms):
+                corrected = query.lower().translate(KEYBOARD_TO_RUSSIAN)
+                corrected_terms = set(terms(corrected))
+                if corrected_terms and corrected_terms.issubset(self.search_terms):
+                    query = corrected
+        query_terms = set(terms(query))
+        if mode == 'smart':
+            for word in set(words(query)) - STOP:
+                original = stem(word)
+                if original not in self.search_terms:
+                    if word.isascii() and word.isalpha():
+                        corrected = self.roman_terms.get(roman_key(word))
+                    else:
+                        corrected = russian_correction(word, self.search_terms)
+                    if corrected:
+                        query_terms.discard(original)
+                        query_terms.add(corrected)
+        query_anchors = anchors(query)
+        if period and not (query_terms - {'письм', 'письма', 'письмам', 'уведомлен'}):
+            return [Hit(i, 1.0, self.letters[i].body[:330], ('Совпала дата',))
+                    for i in self.inbox if scope is None or i in scope][:limit]
+        lexical = defaultdict(float)
+        for term in sorted(query_terms):
+            idf = self.idf.get(term, 0)
+            for i, saturation in self.search_terms.get(term, ()):
+                if scope is None or i in scope:
+                    lexical[i] += idf * saturation
+
+        depth = max(limit, 100)
+        lex_order = heapq.nlargest(depth, lexical, key=lambda i: (lexical[i], -i)) if mode != 'semantic' else []
+        sem_order = []
+        sem_passages = {}
+        query_events = events(query_terms)
+        if mode != 'lexical':
+            if self.dense is not None:
+                sem_order, sem_passages = self.dense.rank(query, scope, depth)
+            elif query_events:
+                candidates = set().union(*(self.event_index[event] for event in query_events))
+                if scope is not None:
+                    candidates &= scope
+                def intent_score(i):
+                    overlap = self.doc_events[i] & query_events
+                    return (sum(1 / math.sqrt(len(self.event_index[event])) for event in sorted(overlap))
+                            * (0.8 + 0.2 * len(overlap) / len(query_events)))
+                sem_order = heapq.nlargest(depth, candidates, key=lambda i: (intent_score(i), lexical.get(i, 0), -i))
+
+        scores = defaultdict(float)
+        signals = defaultdict(set)
+        semantic_weight = 1.15 if not query_anchors else 0.70
+        for order, weight, label in ((lex_order, 1.0, 'По словам'), (sem_order, semantic_weight, 'По смыслу' if self.dense else 'По теме')):
+            for rank, i in enumerate(order, 1):
+                scores[i] += weight / (24 + rank)
+                if rank <= max(12, min(limit, 30)):
+                    signals[i].add(label)
+
+        if query_anchors and mode == 'smart':
+            exact = set().union(*(self.anchor_index[key] for key in query_anchors if key in self.anchor_index))
+            for i in exact if scope is None else exact & scope:
+                matching = query_anchors & self.doc_anchors[i]
+                if matching:
+                    scores[i] += 0.12 * len(matching)
+                    signals[i].add('Совпал номер или адрес')
+
+        actions = query_events - CONTEXT_EVENTS
+        if mode == 'smart' and actions and self.dense is None:
+            for i in sem_order:
+                overlap = len(actions & self.doc_events[i])
+                if overlap:
+                    scores[i] += 0.054 * overlap / len(actions)
+
+        if mode == 'smart' and self.dense is None:
+            # Preserve BM25's score margins: a weak generic match should not
+            # receive almost the same vote as a very specific subject match.
+            peak = max(lexical.values(), default=0)
+            if peak:
+                for i in lex_order:
+                    scores[i] += 0.09 * lexical[i] / peak
+
+        since, until = relative_range(query, as_of) if mode == 'smart' else ('', '')
+        if since:
+            for i in scores:
+                if since <= self.dates[i] <= until:
+                    scores[i] *= 1.55
+                    signals[i].add('Совпала дата')
+
+        hits = []
+        for i in heapq.nlargest(limit, scores, key=lambda i: (scores[i], -i)):
+            if period:
+                signals[i].add('Совпала дата')
+            if 'Совпал номер или адрес' in signals[i] or i not in sem_passages:
+                def passage_score(text):
+                    keys = set(terms(text))
+                    return (len(anchors(text) & query_anchors),
+                            sum(self.idf.get(key, 0.0) for key in sorted(keys & query_terms)),
+                            len(events(keys) & query_events))
+                passage = max(self.passages[i], key=passage_score)
+            else:
+                passage = self.passages[i][sem_passages[i]]
+            evidence = clipped_evidence(passage or self.letters[i].subject, query_terms, query_anchors)
+            hits.append(Hit(i, scores[i], evidence, tuple(sorted(signals[i]))))
+        return hits
+
+
+# evaluate.py
+
+
+import argparse
+import json
+import math
+from collections import defaultdict
+from pathlib import Path
+from statistics import fmean
+from time import perf_counter_ns
+
+
+
+def read_queries(path):
+    seen = set()
+    for line, row in records(path, ('queries',)):
+        query_id = field(row, 'query_id', 'id')
+        query = field(row, 'query', 'text', 'question')
+        if not query_id or not query or query_id in seen:
+            raise ValueError(f'{path}:{line}: expected a unique query_id and query')
+        seen.add(query_id)
+        yield (query_id, query, field(row, 'synthetic_user', 'mailbox_id', 'mailbox'), check_day(field(row, 'query_date', 'as_of')))
+
+
+def read_qrels(path):
+    result = defaultdict(dict)
+    seen = set()
+    for line, row in records(path, ('qrels',)):
+        query_id = field(row, 'query_id')
+        doc_id = field(row, 'doc_id')
+        relevance = int(row.get('relevance', 1))
+        if not query_id or not doc_id or relevance < 0 or relevance > 10 or (query_id, doc_id) in seen:
+            raise ValueError(f'{path}:{line}: invalid or duplicate relevance judgment')
+        seen.add((query_id, doc_id))
+        judgments = result[query_id]
+        if relevance:
+            judgments[doc_id] = relevance
+    return result
+
+
+def metrics(ranked, gold, k):
+    if len(set(ranked)) != len(ranked) or not gold or k < 1:
+        raise ValueError('Expected unique ranked IDs, positive judgments and positive K')
+    gains = [gold.get(doc_id, 0) for doc_id in ranked[:k]]
+    def dcg(values):
+        return sum((2**value - 1) / math.log2(rank + 2) for rank, value in enumerate(values))
+
+    recall = sum(bool(gain) for gain in gains) / len(gold)
+    ndcg = dcg(gains) / dcg(sorted(gold.values(), reverse=True)[:k])
+    rr = next((1 / rank for rank, gain in enumerate(gains, 1) if gain), 0.0)
+    return recall, ndcg, rr
+
+
+def percentile_nearest_rank(values, quantile):
+    return sorted(values)[max(0, math.ceil(len(values) * quantile) - 1)]
+
+
+def evaluate(engine, queries, qrels, modes, cutoffs, repeat, export_k):
+    if qrels is not None:
+        if set(qrels) != {q[0] for q in queries}:
+            raise ValueError('Queries and judgment groups differ; use unscored export for unlabeled queries')
+        for qid, _, box, day in queries:
+            for doc in qrels[qid]:
+                i = engine.by_id.get(doc)
+                if i is None or (box and engine.letters[i].mailbox_id != box) or (day and engine.dates[i] > day):
+                    raise ValueError(f'{qid}: missing or ineligible relevant document {doc}')
+    qrels = qrels or {}
+    results = {}
+    details = {}
+    depth = max(*cutoffs, export_k)
+    for mode in modes:
+        times = []
+        run = []
+        for trial in range(repeat):
+            for query_id, query, mailbox, as_of in queries:
+                started = perf_counter_ns()
+                hits = engine.search(query, mode=mode, limit=depth, mailbox=mailbox, as_of=as_of)
+                doc_ids = [engine.letters[hit.index].doc_id for hit in hits]
+                times.append((perf_counter_ns() - started) / 1e6)
+                if trial == 0:
+                    run.append({'query_id': query_id, 'doc_ids': doc_ids})
+        details[mode] = run
+        report = {'p50_ms': round(percentile_nearest_rank(times, .5), 3),
+                  'p95_ms': round(percentile_nearest_rank(times, .95), 3),
+                  'p99_ms': round(percentile_nearest_rank(times, .99), 3), 'timed_queries': len(times),
+                  'scored_queries': sum(bool(x) for x in qrels.values()),
+                  'judged_without_positives': sum(not x for x in qrels.values())}
+        for k in cutoffs:
+            values = [(metrics(row['doc_ids'], qrels[row['query_id']], k), len(qrels[row['query_id']]))
+                      for row in run if qrels.get(row['query_id'])]
+            if values:
+                report[f'Recall@{k}'] = round(fmean(value[0] for value, _ in values), 5)
+                report[f'nDCG@{k}'] = round(fmean(value[1] for value, _ in values), 5)
+                report[f'MRR@{k}'] = round(fmean(value[2] for value, _ in values), 5)
+                single = [value[2] for value, count in values if count == 1]
+                if single:
+                    report[f'MRR-single@{k}'] = round(fmean(single), 5)
+        results[mode] = report
+    return results, details
+
+
+# server.py
+
+
+import argparse
+import json
+from datetime import date
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from time import perf_counter_ns
+from urllib.parse import parse_qs, urlsplit
+
+
+
+PATHS = {'/': ('index.html', 'text/html; charset=utf-8'), '/styles.css': ('styles.css', 'text/css; charset=utf-8'),
+         '/app.js': ('app.js', 'text/javascript; charset=utf-8')}
+
+
+def summary(letter):
+    return {'doc_id': letter.doc_id, 'mailbox_id': letter.mailbox_id, 'subject': letter.subject,
+            'sender': letter.sender, 'date': letter.date, 'preview': ' '.join(letter.body[:550].split())[:240]}
+
+
+class MailServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, engine, demo, assets=None):
+        super().__init__(address, MailHandler)
+        self.engine = engine
+        self.demo = demo
+        self.reference_day = '2026-11-21' if demo else max(engine.dates, default='') or date.today().isoformat()
+        self.assets = assets if assets is not None else {
+            path: ((ROOT / 'web' / name).read_bytes(), mime) for path, (name, mime) in PATHS.items()}
+
+
+class MailHandler(BaseHTTPRequestHandler):
+    def write_response(self, status, body, mime, started=None):
+        elapsed = (perf_counter_ns() - started) / 1e6 if started else None
+        self.send_response(status)
+        self.send_header('Content-Type', mime)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Content-Security-Policy', "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header('Referrer-Policy', 'no-referrer')
+        if elapsed is not None:
+            self.send_header('Server-Timing', f'backend;dur={elapsed:.3f}')
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def json_response(self, data, status=HTTPStatus.OK, started=None):
+        payload = json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode()
+        self.write_response(status, payload, 'application/json; charset=utf-8', started)
+
+    def do_GET(self):
+        started = perf_counter_ns()
+        engine = self.server.engine
+        try:
+            url = urlsplit(self.path)
+            params = parse_qs(url.query, max_num_fields=16)
+            def get(key, default=''):
+                return params.get(key, [default])[-1].strip()
+
+            if url.path in self.server.assets:
+                data, mime = self.server.assets[url.path]
+                return self.write_response(HTTPStatus.OK, data, mime)
+            if url.path == '/favicon.ico':
+                return self.write_response(HTTPStatus.NO_CONTENT, b'', 'image/x-icon')
+            if url.path == '/api/meta':
+                return self.json_response({'mailboxes': [{'id': box, 'count': len(indexes)} for box, indexes in sorted(engine.boxes.items())],
+                                           'count': len(engine.letters), 'semantic': bool(engine.dense), 'demo': self.server.demo,
+                                           'reference_day': self.server.reference_day})
+            if url.path == '/api/letter':
+                index = engine.by_id.get(get('id'))
+                if index is not None:
+                    return self.json_response(engine.letters[index].serializable())
+                return self.json_response({'error': 'Письмо не найдено.'}, HTTPStatus.NOT_FOUND)
+            mailbox = get('mailbox', get('synthetic_user'))
+            after = check_day(get('after'))
+            before = check_day(get('before'))
+            if after and before and after > before:
+                raise ValueError('Начало периода позже окончания.')
+            limit = min(100, max(1, int(get('limit', '25'))))
+            if url.path == '/api/letters':
+                offset = max(0, int(get('offset', '0')))
+                letters, total = engine.browse(mailbox, after, before, offset, limit, check_day(get('as_of')))
+                return self.json_response({'items': [summary(letter) for letter in letters], 'total': total})
+            if url.path == '/api/search':
+                query = get('q')
+                if not query or len(query) > 600:
+                    raise ValueError('Введите запрос длиной до 600 символов.')
+                mode = get('mode', 'smart')
+                if mode not in {'smart', 'semantic', 'lexical'}:
+                    raise ValueError('Неизвестный режим поиска.')
+                as_of = check_day(get('as_of', get('query_date', date.today().isoformat())))
+                hits = engine.search(query, mode, limit, mailbox, after, before, as_of)
+                output = [dict(summary(engine.letters[hit.index]), evidence=hit.evidence, signals=hit.signals) for hit in hits]
+                return self.json_response({'items': output, 'mode': mode}, started=started)
+        except ValueError as exc:
+            return self.json_response({'error': str(exc)}, HTTPStatus.BAD_REQUEST)
+        self.json_response({'error': 'Страница не найдена.'}, HTTPStatus.NOT_FOUND)
+
+    def log_request(self, code='-', size='-'):
+        # Avoid putting search terms and synthetic mailbox identifiers in logs.
+        if isinstance(code, int) and code >= 500:
+            self.log_error('HTTP %s', code)
+
+
+DEMO_LETTERS = [
+    {'doc_id': 'f-401', 'mailbox_id': 'Поездки', 'subject': 'Изменение времени вылета', 'sender': 'Север Авиа', 'date': '2026-11-20', 'body': 'Здравствуйте!\n\nОтправление рейса SN‑401 в Казань перенесено с 15:20 на 18:40. Посадка начнётся в 18:05, терминал B.\n\nЕсли новый график вам не подходит, свяжитесь со службой поддержки.'},
+    {'doc_id': 'f-2085', 'mailbox_id': 'Поездки', 'subject': 'Бронирование FL-2085 подтверждено', 'sender': 'Билетный сервис', 'date': '2026-11-17', 'body': 'Маршрут: Москва — Казань, рейс SN‑401. Код брони FL-2085.\n\nМинимальное время на пересадку: 40 минут. Сохраните электронный билет до конца поездки.'},
+    {'doc_id': 'f-refund', 'mailbox_id': 'Поездки', 'subject': 'Возмещение по бронированию FL‑2090', 'sender': 'Билетный сервис', 'date': '2026-11-19', 'body': 'Средства в размере 8 450 ₽ перечислены на исходную карту. Возмещение по бронированию FL‑2090 выполнено полностью.\n\nЗачисление зависит от банка и обычно занимает до пяти рабочих дней.'},
+    {'doc_id': 'f-receipt', 'mailbox_id': 'Поездки', 'subject': 'Кассовый чек за бронирование FL‑2090', 'sender': 'Билетный сервис', 'date': '2026-11-18', 'body': 'Оплата бронирования прошла. Списано 8 450 ₽. Фискальный документ доступен в личном кабинете.'},
+    {'doc_id': 'f-hotel', 'mailbox_id': 'Поездки', 'subject': 'Данные для заселения', 'sender': 'Отель «Берег»', 'date': '2026-11-21', 'body': 'С 14:00 вход через правые двери. Ключ от номера на стойке администратора. Выезд до 11:00.'},
+    {'doc_id': 'f-earlier', 'mailbox_id': 'Поездки', 'subject': 'Рейс SN-401 · ноябрьский график', 'sender': 'Север Авиа', 'date': '2026-11-10', 'body': 'По первоначальному расписанию рейс вылетит в 15:20 из терминала B. Отправление в Москву — в 08:10.'},
+    {'doc_id': 'f-delivery', 'mailbox_id': 'Поездки', 'subject': 'Задержка доставки билетов', 'sender': 'Билетный сервис', 'date': '2026-11-20', 'body': 'Бумажные билеты отправлены курьером. Из-за задержки он привезёт конверт завтра.'},
+    {'doc_id': 'f-competition', 'mailbox_id': 'Поездки', 'subject': 'Подтверждение заявки', 'sender': 'Оргкомитет', 'date': '2026-11-19', 'body': 'Заявка на участие рассмотрена и принята. Список финалистов появится в пятницу.'},
+    {'doc_id': 'f-cancel', 'mailbox_id': 'Поездки', 'subject': 'Аннулирование брони FL-2002', 'sender': 'Билетный сервис', 'date': '2026-11-11', 'body': 'Бронь аннулирована по вашему запросу. Заявление зарегистрировано под номером 53618.'},
+    {'doc_id': 'f-other-flight', 'mailbox_id': 'Работа', 'subject': 'Изменение времени вылета', 'sender': 'Деловые поездки', 'date': '2026-11-20', 'body': 'Ваш самолёт улетит позже. Отправление рейса KB-930 в Екатеринбург перенесено на 22:10.'},
+    {'doc_id': 'f-future', 'mailbox_id': 'Поездки', 'subject': 'Дополнительное изменение отправления рейса SN-401', 'sender': 'Север Авиа', 'date': '2026-11-22', 'body': 'Отправление перенесено на 23:20. Это обновление отменяет предыдущие уведомления.'},
+    {'doc_id': 'work-110', 'mailbox_id': 'Работа', 'subject': 'Перенос созвона с командой', 'sender': 'Марина Лазарева', 'date': '2026-11-20', 'body': 'Совещание начнётся в 16:30 вместо запланированных 15:00. Ссылка на конференцию осталась прежней.'},
+    {'doc_id': 'work-111', 'mailbox_id': 'Работа', 'subject': 'Созвон с командой в 11:00', 'sender': 'Марина Лазарева', 'date': '2026-11-19', 'body': 'Коллеги, встречаемся в 11:00. Повестка — обновление документов релиза.'},
+    {'doc_id': 'work-112', 'mailbox_id': 'Работа', 'subject': 'Итоги интервью', 'sender': 'Команда найма', 'date': '2026-11-19', 'body': 'Вы прошли первичный этап. Следующее собеседование состоится в понедельник. Выберите время в календаре.'},
+    {'doc_id': 'work-113', 'mailbox_id': 'Работа', 'subject': 'Акт за ноябрь', 'sender': 'Документооборот', 'date': '2026-11-20', 'body': 'Файл с закрывающими документами приложен к письму: act-63155.pdf. Отдельная подпись не требуется.'},
+    {'doc_id': 'work-114', 'mailbox_id': 'Работа', 'subject': 'Действие ссылки заканчивается', 'sender': 'Документооборот', 'date': '2026-11-18', 'body': 'Срок подачи формы истекает 25 ноября в 18:00. После окончания приём заявок будет остановлен.'},
+    {'doc_id': 'work-115', 'mailbox_id': 'Работа', 'subject': 'Новости офиса', 'sender': 'Офис-менеджер', 'date': '2026-11-21', 'body': 'В понедельник обновят гостевые пропуска. У стойки регистрации можно забрать временный бейдж.'},
+    {'doc_id': 'shop-31', 'mailbox_id': 'Покупки', 'subject': 'Отправление доступно в ячейке', 'sender': 'Пункт выдачи', 'date': '2026-11-21', 'body': 'Заказ PK-62159 размещён в постамате на Лесной, 6. Заберите посылку до 24 ноября. Код доступа к ячейке — 471628.'},
+    {'doc_id': 'shop-32', 'mailbox_id': 'Покупки', 'subject': 'Перенос времени доставки', 'sender': 'Логистика', 'date': '2026-11-18', 'body': 'Курьер приедет вечером, с 19:00 до 21:00. Посылка PK-61917 остаётся у курьера.'},
+    {'doc_id': 'shop-33', 'mailbox_id': 'Покупки', 'subject': 'Автопродление тарифа', 'sender': 'Музыкальный сервис', 'date': '2026-11-20', 'body': 'Следующее списание 299 ₽ запланировано на 27 ноября. Управлять подпиской можно в настройках аккаунта.'},
+    {'doc_id': 'shop-34', 'mailbox_id': 'Покупки', 'subject': 'Восстановление доступа', 'sender': 'Служба безопасности', 'date': '2026-11-16', 'body': 'Для сброса пароля пройдите по ссылке в личном кабинете. Ссылка действительна сорок минут.'},
+    {'doc_id': 'shop-35', 'mailbox_id': 'Покупки', 'subject': 'Оцените недавнюю покупку', 'sender': 'Команда сервиса', 'date': '2026-11-19', 'body': 'Заполните короткую анкету о заказе PK-62159. Ваш отзыв поможет нам улучшить обслуживание.'},
+    {'doc_id': 'shop-36', 'mailbox_id': 'Покупки', 'subject': 'Новый вход в аккаунт', 'sender': 'Служба безопасности', 'date': '2026-11-21', 'body': 'Вход выполнен в 07:12. Если это были не вы, завершите другие сеансы и смените пароль.'},
+    {'doc_id': 'shop-37', 'mailbox_id': 'Покупки', 'subject': 'Ответ на обращение № 62159', 'sender': 'Помощь', 'date': '2026-11-19', 'body': 'Ваше обращение № 62159 принято. Ответ на технический вопрос будет направлен по электронной почте.'},
+    {'doc_id': 'shop-38', 'mailbox_id': 'Покупки', 'subject': 'Вход · одноразовый пароль', 'sender': 'Служба безопасности', 'date': '2026-11-18', 'body': 'Одноразовый код 024681 действует пять минут. Никому не сообщайте его.'},
+    {'doc_id': 'shop-39', 'mailbox_id': 'Покупки', 'subject': 'Компенсация за отмену заказа', 'sender': 'Магазин', 'date': '2026-11-17', 'body': 'Возврат на карточку завершён. Зачислены 1 130 рублей по заказу PK-61820.'},
+    {'doc_id': 'shop-undated', 'mailbox_id': 'Покупки', 'subject': 'Квитанция за ремонт', 'sender': 'Сервисная мастерская', 'date': '', 'body': 'Работы выполнены. Фискальный чек с номером 893160 приложен к письму.'},
+    {'doc_id': 'f-duplicates', 'mailbox_id': 'Поездки', 'subject': 'Городской трансфер в аэропорт', 'sender': 'Служба автобусов', 'date': '2026-11-20', 'body': 'Автобус опаздывает на десять минут. Новый график опубликован на остановке возле терминала.'},
+    {'doc_id': 'work-116', 'mailbox_id': 'Работа', 'subject': 'Подтверждение участия', 'sender': 'Мастерская', 'date': '2026-11-19', 'body': 'Заявление на участие в мастерской принято. Для входа покажите приглашение.'},
+    {'doc_id': 'work-117', 'mailbox_id': 'Работа', 'subject': 'Приглашение на обучение', 'sender': 'Мастерская', 'date': '2026-11-14', 'body': 'Онлайн-конференция начнётся в четверг. Анкета для регистрации закрывается за два дня.'},
+]
+
+
+HTML = r'''<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Почта · Контекст</title>
+  <link rel="stylesheet" href="/styles.css"><script src="/app.js" defer></script>
+</head>
+<body>
+  <svg class="symbols" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="inbox-icon" viewBox="0 0 24 24"><path d="m3 14 3-9h12l3 9v5H3z M3 14h5l2 3h4l2-3h5"/></symbol>
+    <symbol id="star-icon" viewBox="0 0 24 24"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9z"/></symbol>
+    <symbol id="search-icon" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></symbol>
+    <symbol id="tune-icon" viewBox="0 0 24 24"><path d="M3 7h5m5 0h8M3 17h9m5 0h4"/><circle cx="10.5" cy="7" r="2.5"/><circle cx="14.5" cy="17" r="2.5"/></symbol>
+    <symbol id="menu-icon" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></symbol>
+  </svg>
+  <header class="topbar">
+    <div class="identity"><button class="icon-button menu" id="menu" aria-label="Ящики и папки" aria-expanded="false" aria-controls="folders"><svg><use href="#menu-icon"/></svg></button>
+      <button class="brand" id="home" aria-label="Почта — ко входящим"><b aria-hidden="true">@</b>Почта</button></div>
+    <form class="search" id="search-form" role="search">
+      <button class="icon-button search-submit" type="submit" aria-label="Найти"><svg><use href="#search-icon"/></svg></button>
+      <input id="query" type="search" aria-label="Поиск писем" maxlength="600" placeholder="Поиск по почте" autocomplete="off">
+      <button class="icon-button" id="filters-toggle" type="button" aria-label="Фильтры поиска" title="Фильтры поиска" aria-expanded="false" aria-controls="filters"><svg><use href="#tune-icon"/></svg></button>
+    </form>
+  </header>
+  <section class="filters" id="filters" aria-label="Фильтры поиска" hidden>
+    <label>Получено с<input type="date" id="after"></label><label>По<input type="date" id="before"></label>
+    <label>Дата поиска<input type="date" id="as-of"></label>
+    <button type="button" id="reset-filters" class="text-action">Сбросить</button>
+  </section>
+  <div class="layout" id="layout">
+    <button id="scrim" class="scrim" aria-label="Закрыть список ящиков" hidden></button>
+    <aside class="sidebar" id="folders" aria-label="Папки и ящики">
+      <nav aria-label="Папки">
+        <button type="button" class="nav-row is-selected" id="all-mail" aria-pressed="true"><svg><use href="#inbox-icon"/></svg>Входящие <span class="nav-count" id="mail-total"></span></button>
+        <button type="button" class="nav-row" id="saved-mail" aria-pressed="false"><svg><use href="#star-icon"/></svg>Избранное <span class="nav-count" id="saved-total"></span></button>
+      </nav>
+      <h2>Почтовые ящики</h2><nav id="mailboxes" class="mailboxes" aria-label="Ящики"></nav>
+      <small id="source-label">Загрузка…</small>
+    </aside>
+    <main class="surface">
+      <section class="results" aria-labelledby="result-title">
+        <div class="results-head"><div><h1 id="result-title">Входящие</h1><p id="result-detail" role="status">Загружаем письма…</p></div>
+          <div class="pagination" id="pagination" hidden><span id="pages"></span><button id="prev" aria-label="Предыдущая страница">‹</button><button id="next" aria-label="Следующая страница">›</button></div>
+        </div>
+        <div id="modes" class="modes" role="group" aria-label="Режим поиска" hidden>
+          <button type="button" data-mode="smart" aria-pressed="true">Умный поиск</button>
+          <button type="button" data-mode="lexical" aria-pressed="false">По словам</button>
+          <button type="button" data-mode="semantic" id="semantic-mode" aria-pressed="false">По теме</button>
+          <span class="timing" id="timing" hidden></span>
+        </div>
+        <div class="items" id="items"></div>
+      </section>
+      <article class="letter" id="letter" hidden aria-labelledby="letter-subject">
+        <div class="letter-tools"><button class="text-action" id="back">← К списку</button><button type="button" class="text-action" id="save" aria-pressed="false">В избранное</button></div>
+        <h1 id="letter-subject"></h1>
+        <div class="letter-meta"><span class="avatar" id="letter-avatar" aria-hidden="true"></span><div><strong id="letter-sender"></strong><div id="letter-box"></div></div><time id="letter-date"></time></div>
+        <section class="evidence" id="evidence" hidden><h2>Найденный фрагмент</h2><p id="evidence-text"></p><small id="signals"></small></section>
+        <div class="letter-body" id="letter-body"></div>
+      </article>
+    </main>
+  </div>
+</body>
+</html>
+'''
+
+
+CSS = r'''* { box-sizing: border-box; }
+:root { color-scheme: light; --ink: #202531; --muted: #596576; --blue: #145bcc; --tint: #e7f0ff; --line: #e7ebf0; font: 16px/1.5 Roboto, "Segoe UI", Arial, sans-serif; }
+body { margin: 0; color: var(--ink); background: #f6f8fb; }
+button, input { font: inherit; color: inherit; }
+button { border: 0; cursor: pointer; background: transparent; }
+button:focus-visible, input:focus-visible { outline: 3px solid #487ee4; outline-offset: 2px; }
+button:disabled { opacity: .35; cursor: default; }
+[hidden], .symbols { display: none !important; }
+svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; flex: 0 0 auto; }
+.topbar { display: grid; grid-template-columns: 238px minmax(0, 780px); align-items: center; min-height: 88px; gap: 20px; padding: 12px 30px 12px 22px; }
+.identity, .brand, .icon-button, .nav-row, .letter-meta, .letter-tools, .pagination, .filters, .modes, .results-head { display: flex; align-items: center; }
+.brand { padding: 2px 10px; gap: 9px; font-size: 28px; font-weight: 650; letter-spacing: -.9px; }
+.brand b { font: 700 40px/1 Arial,sans-serif; letter-spacing: -3px; color: var(--blue); margin-right: 2px; }
+.icon-button, .pagination button { width: 42px; height: 42px; justify-content: center; border-radius: 8px; color: #4a596c; }
+.icon-button:hover, .pagination button:enabled:hover, .text-action:hover { background: #e6ebf2; }
+.menu { display: none; }
+.search { display: flex; align-items: center; gap: 5px; padding: 3px 6px; min-width: 0; border: 1px solid transparent; background: #e9edf3; border-radius: 12px; }
+.search:focus-within { background: white; border-color: #87a7dc; }
+.search input { flex: 1; width: 0; border: 0; background: transparent; font-size: 18px; padding: 7px 0; outline: none; }
+.search input:focus-visible { outline: none; }
+.search input::placeholder { color: #536072; opacity: 1; }
+.filters { margin: 0 30px 14px 280px; gap: 18px; flex-wrap: wrap; }
+.filters label { font-size: 14px; color: var(--muted); }
+.filters input { display: block; border: 1px solid #c7d0db; background: white; border-radius: 7px; padding: 5px; min-width: 0; }
+.layout { display: grid; grid-template-columns: 238px minmax(0, 1fr); gap: 20px; padding: 0 22px 22px; }
+.sidebar { display: flex; flex-direction: column; padding: 12px 0 18px; align-self: start; min-height: calc(100dvh - 112px); }
+.nav-row { gap: 13px; width: 100%; min-height: 45px; padding: 7px 16px; border-radius: 8px; text-align: left; overflow-wrap: anywhere; font-size: 16px; }
+.nav-row:hover { background: #eaf0f6; }
+.nav-row.is-selected { background: #dfeaff; color: #104eaa; font-weight: 650; }
+.nav-count { margin-left: auto; font-size: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.is-selected .nav-count { color: inherit; }
+.sidebar h2 { font-size: 14px; font-weight: 600; color: var(--muted); margin: 32px 16px 8px; }
+.mailboxes .nav-row::before { content: ''; width: 9px; height: 9px; border: 2px solid #8292a8; border-radius: 50%; margin: 0 5px; flex-shrink: 0; }
+.sidebar small { color: var(--muted); font-size: 13px; margin: auto 16px 0; padding-top: 35px; }
+.surface { border: 1px solid var(--line); border-radius: 15px; background: white; min-height: calc(100dvh - 110px); min-width: 0; overflow: clip; }
+.results-head { gap: 12px; justify-content: space-between; padding: 30px 36px 21px; border-bottom: 1px solid var(--line); }
+h1 { font-size: clamp(28px, 2.5vw, 38px); line-height: 1.2; margin: 0; letter-spacing: -.8px; font-weight: 620; overflow-wrap: anywhere; }
+#result-detail { color: var(--muted); margin: 5px 0 0; font-size: 15px; overflow-wrap: anywhere; }
+.pagination { gap: 2px; flex-shrink: 0; color: var(--muted); font-size: 14px; }
+.pagination button { font-size: 27px; line-height: 1; }
+.pagination span { margin-right: 7px; }
+.mail-item { width: 100%; display: grid; grid-template-columns: 44px minmax(120px, .8fr) minmax(200px, 2.35fr) auto; gap: 18px; align-items: center; text-align: left; padding: 17px 35px; border-bottom: 1px solid var(--line); min-height: 81px; }
+.mail-item:hover { background: #f5f8fc; }
+.mail-item:focus-visible { outline-offset: -3px; }
+.avatar { display: inline-grid; place-items: center; flex-shrink: 0; width: 42px; height: 42px; background: #e2eafb; color: #31598d; border-radius: 50%; font-size: 16px; font-weight: 650; }
+.tone-1 { background: #e5efe7; color: #356348; }.tone-2 { background: #f5e8dd; color: #825733; }.tone-3 { background: #eae5f4; color: #675185; }.tone-4 { background: #deedef; color: #366770; }
+.sender, .subject, .item-preview { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.sender { font-weight: 590; font-size: 16px; }
+.subject { font-size: 18px; line-height: 1.45; font-weight: 580; }
+.item-preview, .time { color: var(--muted); font-size: 15px; }
+.time { white-space: nowrap; font-variant-numeric: tabular-nums; font-size: 14px; }
+.modes { padding: 12px 32px; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
+.modes button, .text-action { font-size: 15px; padding: 8px 12px; border-radius: 7px; }
+.modes button[aria-pressed="true"], .text-action[aria-pressed="true"] { background: var(--tint); color: #134b9a; }
+.modes button:hover { background: #eff3f8; }
+.timing { margin-left: auto; color: var(--muted); font-size: 14px; }
+.empty-items { padding: 48px 36px; color: var(--muted); }
+.reading .results { display: none; }
+.letter { max-width: 950px; margin: auto; padding: 25px clamp(18px,5vw,68px) 70px; }
+.letter-tools { justify-content: space-between; margin: 0 -10px 28px; }
+.text-action { color: var(--blue); }
+.letter-meta { gap: 12px; margin: 25px 0; }
+.letter-meta > div { min-width: 0; overflow-wrap: anywhere; }
+.letter-meta time { margin-left: auto; color: var(--muted); font-size: 14px; }
+#letter-box, .evidence small { color: var(--muted); font-size: 14px; }
+.evidence { margin: 28px 0; padding: 3px 16px; border-left: 3px solid #96b7ed; }
+.evidence h2 { font-size: 15px; color: #315a8c; margin: 0; }
+.evidence p { margin: 6px 0; overflow-wrap: anywhere; }
+mark { background: #ffebad; color: inherit; }
+.letter-body { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 18px; line-height: 1.7; border-top: 1px solid var(--line); padding-top: 26px; }
+@media (max-width: 1080px) {
+  .topbar,.layout { grid-template-columns: 190px minmax(0,1fr); gap: 12px; }
+  .filters { margin-left: 224px; }
+  .mail-item { gap: 12px; padding-inline: 22px; grid-template-columns: 40px minmax(110px,.85fr) minmax(130px,1.8fr) auto; }
+  .results-head { padding-inline: 22px; }
+}
+@media (max-width: 760px) {
+  .topbar { grid-template-columns: auto minmax(0,1fr); padding: 12px; min-height: 68px; gap: 10px; }
+  .brand { font-size: 0; padding: 0 2px; }.brand b { font-size: 31px; }
+  .menu { display: flex; }.icon-button { width: 36px; }
+  .layout { display: block; padding: 0; }.surface { min-height: calc(100dvh - 68px); border-radius: 0; border-inline: 0; }
+  .sidebar { display: none; }.layout.nav-open .sidebar { display: flex; position: fixed; inset: 0 auto 0 0; width: min(285px,82vw); background: #f6f8fb; z-index: 3; padding: 28px 14px; overflow-y: auto; }
+  .scrim { position: fixed; inset: 0; width: 100%; height: 100%; background: #1c283c55; z-index: 2; }
+  .filters { margin: 0 14px 12px; gap: 12px; }.search input { font-size: 16px; }
+  .results-head { padding: 24px 17px 16px; }.pagination span { display: none; }
+  .mail-item { grid-template-columns: 38px minmax(0,1fr) auto; row-gap: 1px; column-gap: 12px; padding: 13px 17px; }
+  .mail-item .avatar { grid-column: 1; grid-row: 1 / 3; width: 37px; height: 37px; font-size: 14px; }
+  .mail-item .sender { grid-column: 2; grid-row: 1; font-size: 15px; }.mail-item .mail-text { grid-column: 2 / 4; grid-row: 2; }
+  .mail-item .time { grid-column: 3; grid-row: 1; font-size: 13px; }.subject { font-size: 17px; }
+  .modes { padding: 9px 12px; gap: 1px; }.modes button { padding: 7px 8px; }
+  .letter { padding: 17px 20px 45px; }.letter-meta { flex-wrap: wrap; }.letter-meta time { font-size: 13px; }
+}
+@media (min-width: 761px) { .scrim { display: none; } }
+'''
+
+
+JS = r''''use strict';
+
+const element = (id) => document.getElementById(id);
+const list = element('items');
+const queryInput = element('query');
+const layout = element('layout');
+const pageSize = 18;
+const number = new Intl.NumberFormat('ru-RU');
+const previewDate = new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+const longDate = new Intl.DateTimeFormat('ru-RU', { dateStyle: 'long', timeZone: 'UTC' });
+const state = { mailbox: '', saved: false, mode: 'smart', query: '', page: 0, open: null, listRun: 0, letterRun: 0,
+  meta: null, storage: '', shortlist: new Set() };
+
+function node(tag, className, text) {
+  const item = document.createElement(tag);
+  if (className) item.className = className;
+  if (text != null) item.textContent = text;
+  return item;
+}
+
+function dateLabel(value, format) {
+  if (!value) return '';
+  const parsed = new Date(value.slice(0, 10));
+  return Number.isFinite(+parsed) ? format.format(parsed) : value;
+}
+
+function senderOf(item) {
+  return item.sender || 'Отправитель не указан';
+}
+
+function titleOf(item) {
+  return item.subject || (item.preview || item.body || '').trim().split('\n')[0].slice(0, 84) || 'Письмо без темы';
+}
+
+function initials(name) {
+  const parts = name.match(/[\p{L}\p{N}]+/gu) || ['П'];
+  return parts.slice(0, 2).map(word => word[0]).join('').toUpperCase();
+}
+
+async function api(route, values = {}) {
+  const params = new URLSearchParams(Object.entries(values).filter(([, value]) => value !== '' && value != null));
+  const response = await fetch(`/api/${route}?${params}`);
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || 'Сервис недоступен.');
+  return { body, timing: response.headers.get('Server-Timing') };
+}
+
+function refreshSelection() {
+  for (const button of list.querySelectorAll('.mail-item')) {
+    button.setAttribute('aria-pressed', String(button.dataset.doc === state.open));
+  }
+  const saved = state.shortlist.has(state.open);
+  element('save').setAttribute('aria-pressed', String(saved));
+  element('save').textContent = saved ? '★ В избранном' : '☆ В избранное';
+  element('saved-total').textContent = state.shortlist.size ? number.format(state.shortlist.size) : '';
+}
+
+function closeLetter(returnFocus = false) {
+  const lastOpen = state.open;
+  state.letterRun++;
+  state.open = null;
+  element('letter').hidden = true;
+  layout.classList.remove('reading');
+  refreshSelection();
+  if (returnFocus) {
+    const button = [...list.querySelectorAll('.mail-item')].find(item => item.dataset.doc === lastOpen);
+    button?.focus();
+  }
+}
+
+function highlight(container, text, query) {
+  const matching = new Set((query.match(/[\p{L}\p{N}]{3,}/gu) || []).map(word => word.toLowerCase().replaceAll('ё', 'е')));
+  let from = 0;
+  container.replaceChildren();
+  for (const token of text.matchAll(/[\p{L}\p{N}]{3,}/gu)) {
+    if (!matching.has(token[0].toLowerCase().replaceAll('ё', 'е'))) continue;
+    container.append(document.createTextNode(text.slice(from, token.index)), node('mark', '', token[0]));
+    from = token.index + token[0].length;
+  }
+  container.append(document.createTextNode(text.slice(from)));
+}
+
+async function openLetter(row, explicit = false) {
+  const run = ++state.letterRun;
+  try {
+    const { body: letter } = await api('letter', { id: row.doc_id });
+    if (run !== state.letterRun) return;
+    state.open = letter.doc_id;
+    element('letter').hidden = false;
+    element('letter-subject').textContent = titleOf({ ...letter, preview: row.subject ? '' : row.preview });
+    element('letter-sender').textContent = senderOf(letter);
+    element('letter-box').textContent = letter.sender ? letter.mailbox_id : '';
+    element('letter-avatar').textContent = initials(senderOf(letter));
+    element('letter-avatar').className = avatarClass(senderOf(letter));
+    element('letter-date').textContent = dateLabel(letter.date, longDate) || 'Дата неизвестна';
+    element('letter-date').dateTime = letter.date.slice(0, 10);
+    element('letter-body').textContent = letter.body || 'В письме нет текста.';
+    element('evidence').hidden = !row.evidence;
+    if (row.evidence) {
+      highlight(element('evidence-text'), row.evidence, state.query);
+      element('signals').textContent = (row.signals || []).join(' · ');
+    }
+    layout.classList.add('reading');
+    refreshSelection();
+    if (explicit) {
+      element('back').focus({preventScroll: true});
+      window.scrollTo(0, 0);
+    }
+  } catch (error) {
+    if (run === state.letterRun) element('result-detail').textContent = error.message;
+  }
+}
+
+function avatarClass(name) {
+  let hash = 0;
+  for (const char of name) hash = (hash * 31 + char.codePointAt(0)) >>> 0;
+  return 'avatar tone-' + hash % 5;
+}
+
+function render(rows, emptyMessage) {
+  list.replaceChildren();
+  if (!rows.length) {
+    list.append(node('p', 'empty-items', emptyMessage));
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const item of rows) {
+    const button = node('button', 'mail-item');
+    button.type = 'button';
+    button.dataset.doc = item.doc_id;
+    button.setAttribute('aria-pressed', String(state.open === item.doc_id));
+    const avatar = node('span', avatarClass(senderOf(item)), initials(senderOf(item)));
+    avatar.setAttribute('aria-hidden', 'true');
+    const content = node('span', 'mail-text');
+    content.append(node('span', 'subject', titleOf(item)),
+      node('span', 'item-preview', item.evidence || item.preview || ''));
+    button.append(avatar, node('span', 'sender', senderOf(item)), content, node('span', 'time', dateLabel(item.date, previewDate)));
+    button.addEventListener('click', () => openLetter(item, true));
+    fragment.append(button);
+  }
+  list.append(fragment);
+}
+
+function navSelection() {
+  const buttons = [element('all-mail'), element('saved-mail'), ...element('mailboxes').children];
+  for (const button of buttons) {
+    const selected = button.id === 'saved-mail' ? state.saved : !state.saved && (button.dataset.box || '') === state.mailbox;
+    button.setAttribute('aria-pressed', String(selected));
+    button.classList.toggle('is-selected', selected);
+  }
+}
+
+async function refresh() {
+  const run = ++state.listRun;
+  const searching = Boolean(state.query && !state.saved);
+  const offset = state.page * pageSize;
+  closeLetter();
+  navSelection();
+  element('result-title').textContent = state.saved ? 'Избранное' : searching ? 'Результаты поиска' : state.mailbox || 'Входящие';
+  element('result-detail').textContent = 'Загрузка…';
+  element('timing').hidden = true;
+  element('modes').hidden = !searching;
+  element('pagination').hidden = true;
+  for (const button of element('modes').querySelectorAll('button')) button.setAttribute('aria-pressed', String(button.dataset.mode === state.mode));
+  list.replaceChildren();
+  try {
+    const filters = { mailbox: state.mailbox, after: element('after').value, before: element('before').value, as_of: element('as-of').value || state.meta?.reference_day };
+    let result;
+    let total;
+    if (state.saved) {
+      const ids = [...state.shortlist].reverse();
+      const items = await Promise.all(ids.slice(offset, offset + pageSize).map(async (id) => {
+        try { const { body } = await api('letter', { id }); return { ...body, preview: body.body.slice(0, 260) }; }
+        catch { return null; }
+      }));
+      result = { body: { items: items.filter(Boolean), total: ids.length } };
+    } else if (searching) {
+      result = await api('search', { ...filters, q: state.query, mode: state.mode, limit: 40 });
+    } else {
+      result = await api('letters', { ...filters, limit: pageSize, offset });
+    }
+    if (run !== state.listRun) return;
+    const rows = result.body.items;
+    total = result.body.total ?? rows.length;
+    const timing = result.timing?.match(/dur=([\d.]+)/);
+    if (timing) {
+      element('timing').textContent = `${number.format(Math.round(10 * Number(timing[1])) / 10)} мс`;
+      element('timing').title = 'Время обработки этого запроса на сервере';
+      element('timing').hidden = false;
+    }
+    const ending = new Intl.PluralRules('ru').select(total);
+    const noun = {one: 'письмо', few: 'письма', many: 'писем', other: 'письма'}[ending];
+    element('result-detail').textContent = searching ? `«${state.query}» · в выдаче ${total}` : `${number.format(total)} ${noun}`;
+    render(rows, state.saved ? 'Здесь появятся письма, которые вы добавите в избранное.' :
+      searching ? 'Совпадений нет. Попробуйте другое описание или снимите фильтр.' : 'В этом разделе пока нет писем.');
+    if (!searching && total > pageSize) {
+      element('pagination').hidden = false;
+      element('pages').textContent = `${number.format(offset + 1)}–${number.format(Math.min(offset + pageSize, total))} из ${number.format(total)}`;
+      element('prev').disabled = state.page === 0;
+      element('next').disabled = offset + pageSize >= total;
+    }
+  } catch (error) {
+    if (run === state.listRun) {
+      element('result-detail').textContent = 'Не удалось загрузить письма';
+      render([], error.message);
+    }
+  }
+}
+
+function selectMailbox(mailbox = '', saved = false, clear = false) {
+  toggleMenu(false);
+  state.mailbox = mailbox;
+  state.saved = saved;
+  state.page = 0;
+  if (clear) { state.query = ''; queryInput.value = ''; }
+  refresh();
+}
+
+function submitSearch() {
+  toggleMenu(false);
+  state.query = queryInput.value.trim();
+  state.saved = false;
+  state.page = 0;
+  refresh();
+}
+
+element('home').addEventListener('click', () => selectMailbox('', false, true));
+element('all-mail').addEventListener('click', () => selectMailbox('', false, true));
+element('saved-mail').addEventListener('click', () => selectMailbox('', true, true));
+element('search-form').addEventListener('submit', (event) => { event.preventDefault(); submitSearch(); });
+queryInput.addEventListener('search', () => { if (!queryInput.value && state.query) submitSearch(); });
+element('filters-toggle').addEventListener('click', () => {
+  const filters = element('filters');
+  filters.hidden = !filters.hidden;
+  element('filters-toggle').setAttribute('aria-expanded', String(!filters.hidden));
+});
+for (const id of ['after', 'before', 'as-of']) element(id).addEventListener('change', () => { state.page = 0; refresh(); });
+element('reset-filters').addEventListener('click', () => {
+  for (const id of ['after', 'before', 'as-of']) element(id).value = '';
+  element('as-of').value = state.meta?.reference_day || '';
+  state.page = 0;
+  refresh();
+});
+for (const button of element('modes').querySelectorAll('button')) button.addEventListener('click', () => {
+  if (state.mode !== button.dataset.mode) { state.mode = button.dataset.mode; refresh(); }
+});
+element('back').addEventListener('click', () => closeLetter(true));
+element('prev').addEventListener('click', () => { if (state.page > 0) { state.page--; refresh(); } });
+element('next').addEventListener('click', () => { state.page++; refresh(); });
+element('save').addEventListener('click', () => {
+  if (state.open == null) return;
+  if (state.shortlist.has(state.open)) state.shortlist.delete(state.open);
+  else state.shortlist.add(state.open);
+  try { localStorage.setItem(state.storage, JSON.stringify([...state.shortlist])); } catch { /* Selection remains available in this tab. */ }
+  refreshSelection();
+  if (state.saved) { state.page = 0; refresh(); }
+});
+function toggleMenu(open) {
+  layout.classList.toggle('nav-open', open);
+  element('menu').setAttribute('aria-expanded', String(open));
+  element('scrim').hidden = !open;
+}
+element('menu').addEventListener('click', () => toggleMenu(!layout.classList.contains('nav-open')));
+element('scrim').addEventListener('click', () => toggleMenu(false));
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    if (layout.classList.contains('nav-open')) { toggleMenu(false); element('menu').focus(); }
+    else if (state.open) closeLetter(true);
+  }
+  if (event.key === '/' && !event.altKey && !event.ctrlKey && !event.metaKey && !event.target.matches('input, textarea, [contenteditable]')) {
+    event.preventDefault();
+    queryInput.focus();
+  }
+});
+
+async function init() {
+  try {
+    const { body } = await api('meta');
+    state.meta = body;
+    state.storage = `context-shortlist-v1-${body.demo ? 'demo' : 'corpus'}`;
+    try {
+      const saved = JSON.parse(localStorage.getItem(state.storage) || '[]');
+      if (Array.isArray(saved)) state.shortlist = new Set(saved.filter(id => typeof id === 'string'));
+    } catch { /* The browser may disable local storage. */ }
+    element('mail-total').textContent = number.format(body.count);
+    element('source-label').textContent = body.demo ? 'Демонстрационный ящик' : 'Локальный почтовый корпус';
+    element('as-of').value = body.reference_day || '';
+    element('semantic-mode').textContent = body.semantic ? 'По смыслу' : 'По теме';
+    for (const { id, count } of body.mailboxes) {
+      const button = node('button', 'nav-row', id);
+      button.type = 'button';
+      button.dataset.box = id;
+      button.append(node('span', 'nav-count', number.format(count)));
+      button.addEventListener('click', () => selectMailbox(id));
+      element('mailboxes').append(button);
+    }
+    await refresh();
+  } catch (error) {
+    element('source-label').textContent = 'Сервис недоступен';
+    element('result-detail').textContent = error.message;
+  }
+}
+
+init();
+'''
 
 
 def main():
-    payload = base64.b64decode(DATA, validate=True)
-    if hashlib.sha256(payload).hexdigest() != "dcc456616473aea0525a325d1ae2494603710e115cd2428751e4b86a90a579fc":
-        raise ValueError("Incomplete download")
-    with tempfile.TemporaryDirectory(prefix="context_demo_") as workspace:
-        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-            archive.extractall(workspace)
-        sys.path.insert(0, workspace)
-        runpy.run_path(str(Path(workspace) / "start_demo.py"), run_name="__main__")
+    import webbrowser
+    parser = argparse.ArgumentParser(description='Context mail search')
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument('--dataset', type=Path, help='Organizer data directory or original ZIP')
+    source.add_argument('--demo', action='store_true', help='Open 30 built-in examples')
+    parser.add_argument('--no-browser', action='store_true')
+    parser.add_argument('--port', type=int, default=0, help='0 selects a free TCP port')
+    add_model_args(parser)
+    args = parser.parse_args()
+    try:
+        dataset = None if args.demo else args.dataset or locate_dataset()
+        if dataset is None and not args.demo and (ROOT / 'documents.jsonl').is_file():
+            dataset = ROOT
+        if dataset:
+            folder = load_dataset(dataset, args.cache_dir)
+            letters = load_letters(folder / 'documents.jsonl')
+        else:
+            letters = [Letter(**row) for row in DEMO_LETTERS]
+        encoder = E5Encoder(args.model_dir) if args.model_dir else None
+        print('Indexing %s letters...' % len(letters), flush=True)
+        engine = SearchEngine(letters, encoder, args.cache_dir)
+        assets = {url: (text.encode('utf8'), PATHS[url][1])
+                  for url, text in (('/', HTML), ('/styles.css', CSS), ('/app.js', JS))}
+        with MailServer(('127.0.0.1', args.port), engine, dataset is None, assets) as server:
+            url = 'http://127.0.0.1:%d/' % server.server_port
+            print(url, flush=True)
+            if not args.no_browser:
+                webbrowser.open(url)
+            server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    except (OSError, ValueError) as exc:
+        parser.exit(1, str(exc) + chr(10))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
