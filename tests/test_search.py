@@ -125,6 +125,26 @@ class SearchTests(unittest.TestCase):
 
 
 class EdgeCaseTests(unittest.TestCase):
+    def test_exact_lookup_does_not_return_similar_numbers(self):
+        engine = SearchEngine([
+            Letter('target', 'b', 'Заказ SYN-b1a349fbc9', 'shop@example.invalid', '2026-01-01', 'Заказ принят.'),
+            Letter('similar', 'b', 'Заказ SYN-b1a349fbc0', 'sale@example.invalid', '2026-01-02', 'Другой заказ.'),
+            Letter('future', 'b', 'Заказ SYN-b1a349fbc9', '', '2026-01-03', ''),
+            Letter('other-box', 'x', 'Заказ SYN-b1a349fbc9', '', '2026-01-01', ''),
+        ])
+        filters = dict(mailbox='b', as_of='2026-01-02')
+        hit, = engine.search('SYN–b1a349fbc9', **filters)
+        self.assertEqual(engine.letters[hit.index].doc_id, 'target')
+        self.assertIn('SYN-b1a349fbc9', hit.evidence)
+        self.assertEqual(engine.search('SYN-b1a349fbc1', **filters), [])
+        hit, = engine.search('shop@example.invalid', **filters)
+        self.assertEqual(hit.evidence, 'shop@example.invalid')
+
+    def test_relative_dates_outside_calendar_are_rejected(self):
+        for query in ('вчера', 'за последние 7 дней', 'в прошлом месяце', 'на прошлой неделе'):
+            with self.subTest(query=query), self.assertRaisesRegex(ValueError, 'пределы календаря'):
+                relative_range(query, '0001-01-01')
+
     def test_receipt_date_and_event_date_have_different_meanings(self):
         self.assertEqual(received_period('письма, полученные 29 февраля 2024 года', '2024-03-01')[:2],
                          ('2024-02-29', '2024-02-29'))

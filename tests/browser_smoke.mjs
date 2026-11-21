@@ -18,6 +18,15 @@ try {
     const page = await browser.newPage({ viewport: {width, height: 850} });
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
+    const linked = new URL(url);
+    linked.hash = 'search?' + new URLSearchParams({q:'Где писали, что самолёт улетит позже?', mailbox:'Поездки', as_of:'2026-11-21'});
+    await page.goto(linked.href);
+    await page.locator('.mail-item[data-doc="f-401"]').waitFor();
+    assert.equal(await page.locator('#as-of').inputValue(), '2026-11-21');
+    assert.equal(await page.locator('#filters').isVisible(), true);
+    await page.locator('#home').click();
+    assert.equal(new URL(page.url()).hash, '');
+    assert.equal(await page.locator('#query').inputValue(), '');
     await page.goto(url);
     await page.locator('.mail-item').first().waitFor();
     const headerColor = () => page.locator('.topbar').evaluate(header => getComputedStyle(header).backgroundColor);
